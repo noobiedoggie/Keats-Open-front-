@@ -1060,39 +1060,39 @@
         ) + I.incomingTroops;
       return Math.max(0, I.troops - keepHome);
     };
-    let best = null,
-      bestScore = 0;
-    for (const n of I.neighbors) {
-      if (n.type === PT.Bot) continue;
-      const sc = scoreTarget(I, n, affordable(n), policy, strat);
-      if (sc > bestScore) {
-        bestScore = sc;
-        best = n;
-      }
-    }
-    if (!best) return false;
-    const outnumber = I.troops > best.troops * 1.3;
-    // Below the trigger we normally keep growing, unless we already clearly
-    // outnumber them (then waiting only lets them grow too).
-    if (I.ratio < policy.trigger && !overflow && !outnumber) return false;
-    const minScore = overflow || outnumber ? 0.6 : 1.2 - aggr * 0.05; // 1.15 .. 0.7
-    if (bestScore < minScore) return false;
-    // Attacker losses per tile are lowest once the stack is >= 1.7x the
-    // defender's whole army (the game's CHEAPEST_TROOP_RATIO of 0.6).
-    const amount = Math.floor(
-      Math.min(affordable(best), best.troops * (1.75 + Math.min(1, best.posts * 0.1))),
-    );
-    // When we clearly outnumber them a smaller stack still wins: blocked
-    // counter-attacks cost them as much as us.
-    const minStack = best.troops * (outnumber ? 0.9 : 1.2);
-    if (amount < minStack || amount < I.maxTroops * 0.05) return false;
-    if (emit("attack", { targetID: best.p.id(), troops: amount })) {
-      brain.cd.mark("attack");
-      brain.target = best.p.displayName();
-      log(
-        `Attacking ${best.p.displayName()} (${fmtTroops(best.troops)} troops vs our ${fmtTroops(I.troops)}) with ${fmtTroops(amount)}`,
+    // Try targets from best to worst: the best one may be too small or too
+    // well defended for this turn, which used to freeze the bot at its cap.
+    const ranked = I.neighbors
+      .filter((n) => n.type !== PT.Bot)
+      .map((n) => ({ n, sc: scoreTarget(I, n, affordable(n), policy, strat) }))
+      .filter((x) => x.sc > 0)
+      .sort((a, b) => b.sc - a.sc);
+    for (const { n: best, sc: bestScore } of ranked) {
+      const outnumber = I.troops > best.troops * 1.3;
+      // Below the trigger we normally keep growing, unless we already clearly
+      // outnumber them (then waiting only lets them grow too).
+      if (I.ratio < policy.trigger && !overflow && !outnumber) continue;
+      const minScore = overflow || outnumber ? 0.6 : 1.2 - aggr * 0.05; // 1.15 .. 0.7
+      if (bestScore < minScore) continue;
+      const canSend = affordable(best);
+      // Attacker losses per tile are lowest once the stack is >= 1.7x the
+      // defender's whole army (the game's CHEAPEST_TROOP_RATIO of 0.6). Small
+      // targets get at least 5% of our cap so they fall fast.
+      const amount = Math.floor(
+        Math.min(canSend, Math.max(best.troops * (1.75 + Math.min(1, best.posts * 0.1)), I.maxTroops * 0.05)),
       );
-      return true;
+      // When we clearly outnumber them a smaller stack still wins: blocked
+      // counter-attacks cost them as much as us.
+      const minStack = best.troops * (outnumber ? 0.9 : 1.2);
+      if (amount < minStack || amount < I.maxTroops * 0.03) continue;
+      if (emit("attack", { targetID: best.p.id(), troops: amount })) {
+        brain.cd.mark("attack");
+        brain.target = best.p.displayName();
+        log(
+          `Attacking ${best.p.displayName()} (${fmtTroops(best.troops)} troops vs our ${fmtTroops(I.troops)}) with ${fmtTroops(amount)}`,
+        );
+        return true;
+      }
     }
     return false;
   }
@@ -1272,8 +1272,8 @@
     else {
       // At the MIRV line: spend on air defence and income instead of cities.
       if (S.defend) wants.push({ type: UT.SAMLauncher, why: "MIRV shield (city cap reached)", upgrade: true, optional: true });
-      if (coastal) wants.push({ type: UT.Port, why: "income (city cap reached)", optional: true });
-      wants.push({ type: UT.Factory, why: "income (city cap reached)", optional: true });
+      if (coastal && P < C) wants.push({ type: UT.Port, why: "income (city cap reached)", optional: true });
+      if (F < C) wants.push({ type: UT.Factory, why: "income (city cap reached)", optional: true });
     }
     return wants;
   }
