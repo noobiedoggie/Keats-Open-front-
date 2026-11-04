@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         OpenFront Autopilot
 // @namespace    https://github.com/noobiedoggie/keats-open-front-
-// @version      2.0.0
+// @version      2.1.0
 // @description  Fully hands-off autopilot + intel HUD for OpenFront.io: starts solo games, spawns, expands, wages war, builds, defends, nukes and requeues by itself.
 // @author       Keats
 // @match        https://openfront.io/*
 // @match        https://*.openfront.io/*
 // @run-at       document-idle
 // @grant        none
+// @noframes
 // ==/UserScript==
 
 /*
@@ -30,6 +31,9 @@
 
 (function () {
   "use strict";
+  // Only the top page, and only once (the Android app may inject it too).
+  if (window.top !== window || window.ofAutopilot) return;
+  window.ofAutopilot = { loading: true };
 
   // ---------------------------------------------------------------------------
   // Constants (mirror the game's enums; values are the strings the game uses)
@@ -1327,6 +1331,14 @@
 #ofap .nb{display:flex;justify-content:space-between;gap:6px;padding:1px 0}
 #ofap .tag{display:inline-block;padding:0 6px;border-radius:9px;background:#223042;border:1px solid #36506d;font-size:11px}
 #ofap.min .bd{display:none}
+#ofap .hd{touch-action:none}
+@media (max-width:520px){
+  #ofap{width:calc(100vw - 16px);max-width:340px;right:8px;top:8px;font-size:13px}
+  #ofap .bd{max-height:62vh}
+  #ofap button{padding:6px 12px}
+  #ofap input[type=checkbox]{width:18px;height:18px}
+  #ofap .grid{gap:6px 10px}
+}
 `;
 
   let panel = null;
@@ -1377,7 +1389,11 @@
         <input type="range" min="1" max="10" step="1" data-k="aggression">
         <div class="sec">Activity</div>
         <div class="log" data-f="log"></div>
-        <div class="muted" style="margin-top:6px">Shift+B start/stop · Shift+H hide</div>
+        <div class="muted" style="margin-top:6px">${
+          matchMedia("(pointer: coarse)").matches
+            ? "Tap – to shrink the panel · drag the title bar to move it"
+            : "Shift+B start/stop · Shift+H hide"
+        }</div>
       </div>`;
     document.body.appendChild(panel);
 
