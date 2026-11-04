@@ -970,8 +970,11 @@
         const lossPerTile = 80 * clamp(I.troops / Math.max(1, incomingTroops), 0.6, 2) * (0.35 + 0.0039 * density);
         const tilesLost = incomingTroops / lossPerTile;
         const ourLossIfDefended = tilesLost * density;
-        const worthBlocking = tilesLost > I.land * 0.03 || ourLossIfDefended > incomingTroops * 0.6;
+        // Lost land grows back, lost troops hurt now: block only a bite of
+        // 15%+ of our land, or when defending would cost us more than 60%.
+        const worthBlocking = tilesLost > I.land * 0.15 || ourLossIfDefended > incomingTroops * 0.6;
         if (!worthBlocking) continue; // let it break on our land
+        if (available < incomingTroops) continue; // a partial block just throws troops away
         let amount = Math.min(available, incomingTroops * 1.05);
         // Their army is out of the house: hit back for real, but never empty
         // ours. (A real game was lost by answering a 200K attack with our
@@ -1229,7 +1232,7 @@
     const coastal = I.shore.length > 0;
     const wants = [];
 
-    if (S.defend && policy.threat > 0.35 && D < 2 + Math.floor(policy.threat / 0.4)) {
+    if (S.defend && policy.threat > 0.35 && D < Math.min(6, 2 + Math.floor(policy.threat / 0.4))) {
       wants.push({ type: UT.DefensePost, why: "under attack" });
     }
     if (S.defend && I.nukesAtUs > 0 && SAM < C + 1) {
@@ -1241,7 +1244,7 @@
     }
     if (C === 0) wants.push({ type: UT.City, why: "first city" });
     // A strong player next door: fortify that border right after the first city.
-    if (S.defend && C >= 1 && (strat.massing || strat.careful) && D < 2 + strat.dangerous.length) {
+    if (S.defend && C >= 1 && (strat.massing || strat.careful) && D < Math.min(5, 2 + strat.dangerous.length)) {
       wants.push({
         type: UT.DefensePost,
         why: strat.careful ? "strong player next door" : "neighbour massing troops",
