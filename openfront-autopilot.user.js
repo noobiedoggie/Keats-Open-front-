@@ -575,8 +575,11 @@
       if (S.adaptive && massing) aggr -= 1;
     }
     if (S.adaptive && biggestPlayer > 0 && I.troops > biggestPlayer * 2) aggr += 1;
+    // Nations target the land / city leader with MIRVs and invasions.
+    const leader = I.rank === 1 && I.playerCount > 2;
     return {
       stance,
+      leader,
       aggr: clamp(aggr, 1, 10),
       threat,
       massing,
@@ -602,6 +605,9 @@
       trigger += Math.min(0.2, threat * 0.3);
     }
     if (strat.massing) reserve += 0.08;
+    // The leader is who the game's nations MIRV, then invade. Being caught
+    // with an empty army is how a dominant game was lost: keep 40%+ home.
+    if (strat.leader && I.enemySilos > 0) reserve = Math.max(reserve, 0.4);
     // Early land grab: unclaimed land is cheap, expand faster.
     if (I.unclaimedContacts > 0 && I.neighbors.length === 0) {
       reserve -= 0.08;
@@ -962,7 +968,8 @@
     if (doBotHunt(g, me, I, policy, strat)) return true;
 
     const nonBotAttacks = I.outgoing.filter((a) => !isBotID(I, a.targetID)).length;
-    const maxConcurrent = 1 + Math.ceil(aggr / 5); // 2..3
+    // Leading: one war at a time, never spread thin.
+    const maxConcurrent = strat.leader ? 1 : 1 + Math.ceil(aggr / 5); // 1..3
     if (nonBotAttacks >= maxConcurrent) return false;
 
     // Near the cap troops stop growing, so anything above it is wasted.
@@ -1042,7 +1049,8 @@
     // Only when land targets are exhausted.
     if (I.unclaimedContacts > 0 || strat.bots.length > 0) return false;
     if (I.neighbors.some((n) => scoreTarget(I, n, policy.sendable, policy, strat) > 0.8)) return false;
-    if (I.mine[UT.Transport].length >= (policy.aggr >= 7 ? 2 : 1)) return false;
+    if (I.mine[UT.Transport].length >= (policy.aggr >= 7 && !strat.leader ? 2 : 1)) return false;
+    if (strat.leader && I.outgoing.some((a) => a.targetID !== 0 && !isBotID(I, a.targetID))) return false;
     if (!brain.cd.ready("boat", 15000)) return false;
     brain.cd.mark("boat");
 
@@ -1128,8 +1136,9 @@
     if (S.defend && I.nukesAtUs > 0 && SAM < C + 1) {
       wants.push({ type: UT.SAMLauncher, why: "nukes incoming" });
     }
-    if (S.defend && I.enemySilos > 0 && SAM < Math.max(1, Math.ceil(C * 0.35))) {
-      wants.push({ type: UT.SAMLauncher, why: "enemies have nukes" });
+    const samTarget = strat.leader ? Math.ceil(C * 0.5) : Math.ceil(C * 0.35);
+    if (S.defend && I.enemySilos > 0 && SAM < Math.max(1, samTarget)) {
+      wants.push({ type: UT.SAMLauncher, why: strat.leader ? "leader: MIRV shield" : "enemies have nukes" });
     }
     if (C === 0) wants.push({ type: UT.City, why: "first city" });
     // A strong player next door: fortify that border right after the first city.
@@ -1163,7 +1172,13 @@
       wants.push({ type: UT.MissileSilo, why: "second silo" });
     }
     if (S.defend && I.enemySilos > 0 && SAM > 0) {
-      wants.push({ type: UT.SAMLauncher, why: "stronger air defence", upgrade: true, optional: true });
+      // Each SAM level shoots down one more MIRV warhead and reaches further.
+      wants.push({
+        type: UT.SAMLauncher,
+        why: "stronger air defence",
+        upgrade: true,
+        optional: !(strat.leader && I.gold > 5_000_000),
+      });
     }
     wants.push({ type: UT.City, why: "grow economy", cityChoice: true });
     return wants;
@@ -1428,7 +1443,9 @@
           best = t;
         }
       }
-      if (best === null) continue;
+      // Not worth a nuke (atom 750K, hydrogen 5M): skip thin targets.
+      const minValue = type === UT.AtomBomb ? 8 : type === UT.HydrogenBomb ? 20 : 40;
+      if (best === null || bestVal < minValue) continue;
       const res = await me.buildables(best, [type]);
       const b = (res || []).find((x) => x.type === type);
       if (!b || b.canBuild === false) continue;
