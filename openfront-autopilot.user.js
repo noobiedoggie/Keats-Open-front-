@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront Autopilot
 // @namespace    https://github.com/noobiedoggie/keats-open-front-
-// @version      2.3.0
+// @version      2.4.0
 // @description  Fully hands-off autopilot + intel HUD for OpenFront.io: starts solo games, spawns, expands, wages war, builds, defends, nukes and requeues by itself.
 // @author       Keats
 // @match        https://openfront.io/*
@@ -275,6 +275,8 @@
     troopHistory: new Map(), // smallID -> [{tick, troops}] for trend detection
     gameEndHandled: false,
     openingSent: false,
+    spawn: null,
+    spawnMoves: 0,
     reset() {
       this.cd.reset();
       this.intel = null;
@@ -286,6 +288,9 @@
       this.gameEndHandled = false;
       this.openingSent = false;
       this.review = null;
+      this.spawn = null;
+      this.spawnMoves = 0;
+      this.nukeHit = null;
     },
   };
 
@@ -294,6 +299,20 @@
     const dx = g.x(a) - g.x(b);
     const dy = g.y(a) - g.y(b);
     return Math.sqrt(dx * dx + dy * dy);
+  }
+  /** Distance from tile p to the segment a-b. */
+  function segmentDist(g, p, a, b) {
+    const px = g.x(p),
+      py = g.y(p),
+      ax = g.x(a),
+      ay = g.y(a),
+      bx = g.x(b),
+      by = g.y(b);
+    const dx = bx - ax,
+      dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    const t = len2 === 0 ? 0 : clamp(((px - ax) * dx + (py - ay) * dy) / len2, 0, 1);
+    return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
   }
   function minDist(g, t, list, cap = Infinity) {
     let best = cap;
@@ -597,11 +616,58 @@
   }
 
   // ----- spawn -------------------------------------------------------------------
-  function chooseSpawn(g) {
+  // Terrain decides how fast land falls: plains are cheapest to take.
+  const TERRAIN_VALUE = [1.0, 0.75, 0.5]; // Plains, Highland, Mountain
+
+  /** Score a spawn tile: free land we can actually reach, bots to eat, players to avoid. */
+  function scoreSpawn(g, start, mySid, ownerType) {
+    const R = 45; // look this far around
+    const R2 = R * R;
+    const sx = g.x(start),
+      sy = g.y(start);
+    const seen = new Set([start]);
+    const queue = [start];
+    let land = 0,
+      bots = 0,
+      coast = 0,
+      enemyNear = 0,
+      nodes = 0;
+    // Flood fill over land only: land across the sea does not count.
+    while (queue.length && nodes < 7000) {
+      const t = queue.pop();
+      nodes++;
+      const o = g.ownerID(t);
+      if (o === 0 || o === mySid) {
+        land += TERRAIN_VALUE[safe(() => g.terrainType(t), 0)] ?? 0.5;
+      } else if (ownerType(o) === PT.Bot) {
+        bots += 0.8; // easy land, and all their gold when they die
+      } else {
+        const d = Math.hypot(g.x(t) - sx, g.y(t) - sy);
+        enemyNear += 30 / Math.max(5, d); // the closer a real player, the worse
+        continue; // do not walk through other players
+      }
+      for (const n of g.neighbors(t)) {
+        if (seen.has(n)) continue;
+        seen.add(n);
+        const dx = g.x(n) - sx,
+          dy = g.y(n) - sy;
+        if (dx * dx + dy * dy > R2) continue;
+        if (!g.isLand(n)) {
+          coast++;
+          continue;
+        }
+        if (safe(() => g.isImpassable(n), false)) continue;
+        queue.push(n);
+      }
+    }
+    // Some coast is good (ports, trade); a tiny island is not.
+    const coastBonus = Math.min(coast, 120) * 0.5;
+    return land + bots + coastBonus - enemyNear * 40;
+  }
+
+  function chooseSpawn(g, mySid) {
     const W = g.width(),
       H = g.height();
-    let best = null,
-      bestScore = -Infinity;
     const typeCache = new Map();
     const ownerType = (sid) => {
       if (!typeCache.has(sid)) {
@@ -609,58 +675,67 @@
       }
       return typeCache.get(sid);
     };
-    for (let i = 0; i < 1500; i++) {
+    // Stage 1: cheap screening of many random spots.
+    const screened = [];
+    for (let i = 0; i < 3000 && screened.length < 400; i++) {
       const x = Math.floor(Math.random() * W);
       const y = Math.floor(Math.random() * H);
       const t = g.ref(x, y);
-      if (!g.isLand(t) || g.ownerID(t) !== 0) continue;
-      if (safe(() => g.isImpassable(t), false)) continue;
-      let land = 0,
-        enemy = 0,
-        bots = 0,
-        water = 0;
-      for (let dy = -20; dy <= 20; dy += 2) {
-        for (let dx = -20; dx <= 20; dx += 2) {
-          const nx = x + dx,
-            ny = y + dy;
-          if (!g.isValidCoord(nx, ny)) continue;
-          const n = g.ref(nx, ny);
-          const o = g.ownerID(n);
-          if (o !== 0) {
-            if (ownerType(o) === PT.Bot) bots++;
-            else enemy++;
-          } else if (g.isLand(n)) land++;
-          else water++;
+      if (!g.isLand(t) || safe(() => g.isImpassable(t), false)) continue;
+      const o = g.ownerID(t);
+      if (o !== 0 && o !== mySid) continue;
+      let free = 0,
+        enemy = 0;
+      for (let dy = -24; dy <= 24; dy += 4) {
+        for (let dx = -24; dx <= 24; dx += 4) {
+          if (!g.isValidCoord(x + dx, y + dy)) continue;
+          const n = g.ref(x + dx, y + dy);
+          const no = g.ownerID(n);
+          if (no === 0 || no === mySid) {
+            if (g.isLand(n)) free++;
+          } else if (ownerType(no) !== PT.Bot) enemy++;
         }
       }
-      // Lots of free land, bots to eat (easy land + all their gold), no real
-      // player close by, a little coast for trade.
-      const score = land + bots * 0.8 - enemy * 6 + (water > 0 && water < 60 ? 18 : 0);
-      if (score > bestScore) {
-        bestScore = score;
-        best = t;
+      screened.push({ t, quick: free - enemy * 4 });
+    }
+    screened.sort((a, b) => b.quick - a.quick);
+    // Stage 2: real evaluation of the best candidates.
+    let best = null,
+      bestScore = -Infinity;
+    for (const c of screened.slice(0, 18)) {
+      const sc = scoreSpawn(g, c.t, mySid, ownerType);
+      if (sc > bestScore) {
+        bestScore = sc;
+        best = c.t;
       }
     }
-    return best;
+    return best === null ? null : { tile: best, score: bestScore, ownerType };
   }
 
   function doSpawn(g) {
-    const me = g.myPlayer();
-    if (me && me.hasSpawned && me.hasSpawned()) {
-      brain.plan = "Spawned, waiting for the game to start";
-      return;
-    }
     if (!S.autoSpawn) {
       brain.plan = "Spawn phase (auto-spawn off)";
       return;
     }
-    if (!brain.cd.ready("spawn", 4000)) return;
-    const t = chooseSpawn(g);
-    if (t === null) return;
+    // Re-check every few seconds: nations keep spawning during this phase, and
+    // the spawn can be moved until the game starts.
+    if (!brain.cd.ready("spawn", brain.spawn ? 5000 : 1500)) return;
     brain.cd.mark("spawn");
-    if (emit("spawn", { tile: t })) {
-      brain.plan = "Picked a spawn";
-      log(`Spawning at (${g.x(t)}, ${g.y(t)})`);
+    const me = g.myPlayer();
+    const mySid = me ? me.smallID() : -1;
+    const pick = chooseSpawn(g, mySid);
+    if (!pick) return;
+    if (brain.spawn) {
+      const current = scoreSpawn(g, brain.spawn.tile, mySid, pick.ownerType);
+      brain.plan = `Spawned – spot score ${Math.round(current)}`;
+      if (brain.spawnMoves >= 3 || pick.score < current * 1.3 + 50) return;
+      log(`Moving spawn: better spot found (${Math.round(current)} → ${Math.round(pick.score)})`);
+      brain.spawnMoves++;
+    }
+    if (emit("spawn", { tile: pick.tile })) {
+      brain.spawn = pick;
+      brain.plan = `Spawned – spot score ${Math.round(pick.score)}`;
+      log(`Spawning at (${g.x(pick.tile)}, ${g.y(pick.tile)}), spot score ${Math.round(pick.score)}`);
     }
   }
 
@@ -759,7 +834,11 @@
     if (I.immunity && n.type !== PT.Bot) return -1;
     if (I.nationImmunity && n.type === PT.Nation) return -1;
     if (n.type === PT.Human && !S.attackHumans) return -1;
-    if (n.type !== PT.Bot) {
+    const nuked = brain.nukeHit && brain.nukeHit.sid === n.sid && now() < brain.nukeHit.until;
+    if (n.type !== PT.Bot && nuked) {
+      // We just nuked them: strike while their troops are down.
+      if (I.troops < n.troops) return -1;
+    } else if (n.type !== PT.Bot) {
       // Only fight players we clearly outclass.
       if (I.troops < n.troops * strengthNeeded(policy, n)) return -1;
       // A strong player is next door: only pick on tiny ones.
@@ -777,6 +856,7 @@
     if (n.land < I.land * 0.08) score *= 1.4; // finish off the nearly dead
     score /= 1 + n.posts * 0.08; // fortified players cost more
     const hittingUs = I.attackers.get(n.sid) || 0;
+    if (nuked) score *= 1.8;
     if (hittingUs > 0 && n.troops < I.troops) score *= 1.6; // revenge while they are committed
     if (n.trend > 0.35 && n.troops < I.troops) score *= 1.2; // strike before they finish massing
     // Stick to one war at a time.
@@ -866,7 +946,7 @@
     // 2) Unclaimed land, like the game's nations do it: half the army goes out
     // the moment the game starts, then everything above the expansion floor
     // every few seconds (attacks on the same target merge in the game).
-    if (S.expand && I.unclaimedContacts > 0 && brain.cd.ready("expand", 2000 + (10 - aggr) * 200)) {
+    if (S.expand && I.unclaimedContacts > 0 && brain.cd.ready("expand", 1500 + (10 - aggr) * 150)) {
       const opening = !brain.openingSent;
       let amount = opening ? I.troops * 0.5 : policy.safeSendable;
       if (strat.bots.length > 0 && !opening) amount *= 0.6; // leave some for the bot hunt
@@ -933,6 +1013,12 @@
 
     const amount = Math.floor(policy.sendable * 0.6);
     if (amount < I.maxTroops * 0.05) return false;
+    // Enemy warships shoot transport ships within ~130 tiles: never sail near one.
+    const enemyWarships = g
+      .units(UT.Warship)
+      .filter((u) => u.owner() && u.owner().smallID() !== I.myID && !safe(() => me.isFriendly(u.owner()), false))
+      .map((u) => u.tile());
+    const WARSHIP_DANGER = 150;
     const W = g.width(),
       H = g.height();
     const cands = [];
@@ -957,6 +1043,7 @@
         if (odds < (isBot ? 1.2 : 1.5)) continue;
         weakness = Math.min(3, odds) * (isBot ? 2.5 : 1);
       }
+      if (enemyWarships.some((w) => dist(g, w, t) < WARSHIP_DANGER)) continue; // guarded coast
       const d = Math.hypot(x - I.cx, y - I.cy);
       cands.push({ t, score: weakness * 100 - d * 0.6 });
     }
@@ -964,6 +1051,11 @@
     for (const c of cands.slice(0, 5)) {
       const src = await me.bestTransportShipSpawn(c.t);
       if (src === false || src === null || src === undefined) continue;
+      // The sea route (approximated by the straight line) must stay clear of warships.
+      if (enemyWarships.some((w) => segmentDist(g, w, src, c.t) < WARSHIP_DANGER - 10)) {
+        log(`Skipped a naval landing at (${g.x(c.t)}, ${g.y(c.t)}): enemy warships guard the route`);
+        continue;
+      }
       if (emit("boat", { dst: c.t, troops: amount })) {
         const o = g.ownerID(c.t);
         const who = o === 0 ? "free land" : safe(() => g.playerBySmallID(o).displayName(), "enemy");
@@ -1016,6 +1108,12 @@
     // Each city level adds 250K max troops: by far the best buy in the game.
     // Keep at least as many cities as ports + factories.
     if (C < 2 || C <= P + F) wants.push({ type: UT.City, why: "+250K max troops", cityChoice: true });
+    // Nuclear program as early as the economy allows: a silo right after the
+    // first two cities, then a SAM so enemy nukes can't wipe us out.
+    if (S.nukes && C >= 2 && M === 0) wants.push({ type: UT.MissileSilo, why: "nuclear program" });
+    if (S.defend && C >= 2 && SAM === 0 && (M > 0 || !S.nukes || I.enemySilos > 0)) {
+      wants.push({ type: UT.SAMLauncher, why: "air defence before enemies nuke us" });
+    }
     if (coastal && P < Math.max(1, Math.round(C * 0.75))) {
       wants.push({ type: UT.Port, why: "trade income" });
     }
@@ -1026,8 +1124,8 @@
       wants.push({ type: UT.Factory, why: "train income" });
     }
     // Fortify the border with a neighbour that is massing an army.
-    if (S.nukes && C >= 3 && M < (I.landShare > 0.2 ? 2 : 1)) {
-      wants.push({ type: UT.MissileSilo, why: "nuclear option" });
+    if (S.nukes && C >= 4 && M < (I.landShare > 0.2 ? 2 : 1)) {
+      wants.push({ type: UT.MissileSilo, why: "second silo" });
     }
     if (S.defend && I.enemySilos > 0 && SAM > 0) {
       wants.push({ type: UT.SAMLauncher, why: "stronger air defence", upgrade: true, optional: true });
@@ -1204,7 +1302,7 @@
     if (!brain.cd.ready("nuke", 20000)) return;
     if (safe(() => me.readyMissileCount(), 1) <= 0) return;
     // Don't burn money on nukes while the economy is tiny.
-    if (I.mine[UT.City].length < 3) return;
+    if (I.mine[UT.City].length < 2) return;
 
     // Only nuke someone we are actually fighting (or, in the endgame, any
     // rival). Nuking a giant we just asked for peace would only provoke it.
@@ -1213,6 +1311,7 @@
       I.attackers.has(p.smallID()) ||
       I.outgoing.some((a) => a.targetID === p.smallID()) ||
       strat.stance === "Endgame" ||
+      strat.dangerous.some((n) => n.sid === p.smallID()) || // the strong neighbour: nuke it down to size
       (neighborIDs.has(p.smallID()) && num(p.troops()) < I.troops * 1.3);
     const hostile = g
       .players()
@@ -1274,6 +1373,8 @@
       if (I.gold < cost * (type === UT.AtomBomb ? 1.3 : 1.1)) continue;
       if (emit("build", { unit: type, tile: best, rocketDirectionUp: true })) {
         brain.cd.mark("nuke");
+        // Follow up on land while their troops are down.
+        brain.nukeHit = { sid: target.smallID(), until: now() + 40000 };
         log(`☢ Launched ${type} at ${target.displayName()} (value ${bestVal})`);
         return;
       }
