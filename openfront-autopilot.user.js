@@ -838,11 +838,10 @@
     if (I.immunity && n.type !== PT.Bot) return -1;
     if (I.nationImmunity && n.type === PT.Nation) return -1;
     if (n.type === PT.Human && !S.attackHumans) return -1;
+    // Land we just nuked is fallout: the engine multiplies attacker losses and
+    // conquest time by 2.5-5x there, so do not follow a nuke up on land.
     const nuked = brain.nukeHit && brain.nukeHit.sid === n.sid && gameNow() < brain.nukeHit.until;
-    if (n.type !== PT.Bot && nuked) {
-      // We just nuked them: strike while their troops are down.
-      if (I.troops < n.troops) return -1;
-    } else if (n.type !== PT.Bot) {
+    if (n.type !== PT.Bot) {
       // Only fight players we clearly outclass.
       if (I.troops < n.troops * strengthNeeded(policy, n)) return -1;
       // A strong player is next door: only pick on tiny ones.
@@ -860,7 +859,7 @@
     if (n.land < I.land * 0.08) score *= 1.4; // finish off the nearly dead
     score /= 1 + n.posts * 0.08; // fortified players cost more
     const hittingUs = I.attackers.get(n.sid) || 0;
-    if (nuked) score *= 1.8;
+    if (nuked) score *= 0.3;
     if (hittingUs > 0 && n.troops < I.troops) score *= 1.6; // revenge while they are committed
     if (n.trend > 0.35 && n.troops < I.troops) score *= 1.2; // strike before they finish massing
     // Stick to one war at a time.
@@ -918,11 +917,14 @@
         const available = Math.max(0, I.troops - I.maxTroops * 0.05);
         if (available < incomingTroops * 0.3) continue; // hopeless: keep troops as defenders
         let amount = Math.min(available, incomingTroops * 1.05);
-        // Their army is out of the house: hit back for real.
+        // Their army is out of the house: hit back for real, but never empty
+        // ours. (A real game was lost by answering a 200K attack with our
+        // whole 2.3M army: the 1M-strong attacker then walked in.)
         const theirHome = num(p.troops());
-        const spare = available - amount;
-        if (S.attackPlayers && spare >= theirHome * 1.7 && spare >= I.maxTroops * 0.05) {
-          amount += Math.min(spare, theirHome * 2.5);
+        const keepHome = Math.max(theirHome * 1.1, policy.homeGuard, I.maxTroops * 0.3);
+        const spare = I.troops - amount - keepHome;
+        if (S.attackPlayers && theirHome < I.troops * 0.5 && spare >= theirHome * 1.7 && spare >= I.maxTroops * 0.05) {
+          amount += Math.min(spare, theirHome * 2);
         }
         amount = Math.floor(amount);
         if (emit("attack", { targetID: p.id(), troops: amount })) {
@@ -1222,17 +1224,20 @@
     return out;
   }
 
-  /** Cheapest upgrade candidate of a type, with its cost. */
-  async function upgradeOption(me, I, type) {
-    const units = I.mine[type].filter((u) => !u.isUnderConstruction());
+  /** Cheapest upgrade candidate of a type: how many levels we can buy, and for how much. */
+  async function upgradeOption(me, I, type, skip = new Set(), gold = Infinity) {
+    const units = I.mine[type].filter((u) => !u.isUnderConstruction() && !skip.has(u.id && u.id()));
     if (units.length === 0) return null;
     units.sort((a, b) => a.level() - b.level());
     const u = units[0];
     const res = await me.buildables(u.tile(), [type]);
     const b = (res || []).find((x) => x.type === type && x.canUpgrade !== false);
     if (!b) return null;
-    const cost = num(b.upgradeCosts && b.upgradeCosts.length ? b.upgradeCosts[0] : b.cost);
-    return { unit: u, id: b.canUpgrade, cost };
+    // upgradeCosts[k-1] is the total for k levels at once.
+    const costs = (b.upgradeCosts && b.upgradeCosts.length ? b.upgradeCosts : [b.cost]).map(num);
+    let amount = 1;
+    for (let k = 2; k <= Math.min(costs.length, 5); k++) if (costs[k - 1] <= gold) amount = k;
+    return { unit: u, id: b.canUpgrade, cost: costs[amount - 1], amount };
   }
 
   /** Cheapest valid new placement of a type, with its cost. */
@@ -1251,7 +1256,22 @@
     if (!S.build && !S.defend) return;
     if (!brain.cd.ready("build", 2500)) return;
     if (I.owned.length === 0) return;
+    // Late game income (trade, conquered gold) far outpaces one purchase per
+    // cycle, so keep buying while the money is there.
+    let gold = I.gold;
+    let bought = 0;
+    const upgraded = new Set();
+    for (let round = 0; round < 6; round++) {
+      const spent = await buildOnce(g, me, I, policy, strat, gold, upgraded);
+      if (spent <= 0) break;
+      gold -= spent;
+      bought++;
+    }
+    if (bought > 0) brain.cd.mark("build");
+  }
 
+  /** Buys the most wanted affordable thing; returns the gold spent (0 = nothing). */
+  async function buildOnce(g, me, I, policy, strat, gold, upgraded) {
     for (const want of wantedStructures(I, policy, strat)) {
       const isDefense =
         want.type === UT.DefensePost || want.type === UT.SAMLauncher || want.type === UT.Warship;
@@ -1261,15 +1281,18 @@
 
       let action = null; // {kind:'build'|'upgrade', cost, ...}
       if (want.upgrade) {
-        const up = await upgradeOption(me, I, want.type);
+        const up = await upgradeOption(me, I, want.type, upgraded, gold);
         if (up) action = { kind: "upgrade", ...up };
       } else if (want.cityChoice) {
-        // New city or upgrade: pick whichever is cheaper, but prefer
-        // upgrading once territory is dense so we don't sprawl.
+        // New city or upgrade: same price and same +250K troops, so prefer
+        // upgrades once territory is dense so we don't sprawl.
         const dense = structureCount(I) / Math.max(1, I.land) > 1 / 1500;
-        const [nb, up] = [await buildOption(g, me, I, UT.City), await upgradeOption(me, I, UT.City)];
-        if (nb && up) action = up.cost < nb.cost * (dense ? 1.6 : 0.9) ? { kind: "upgrade", ...up } : { kind: "build", ...nb };
-        else if (nb) action = { kind: "build", ...nb };
+        const nb = await buildOption(g, me, I, UT.City);
+        const up = await upgradeOption(me, I, UT.City, upgraded, gold);
+        if (nb && up) {
+          const perLevel = up.cost / up.amount;
+          action = perLevel < nb.cost * (dense ? 1.6 : 0.9) ? { kind: "upgrade", ...up } : { kind: "build", ...nb };
+        } else if (nb) action = { kind: "build", ...nb };
         else if (up) action = { kind: "upgrade", ...up };
       } else {
         const nb = await buildOption(g, me, I, want.type, want.proactive);
@@ -1277,26 +1300,34 @@
       }
       if (!action) continue;
 
-      if (I.gold < action.cost) {
+      if (gold < action.cost) {
         if (want.optional) continue;
-        brain.plan = `Saving for ${want.type}${action.kind === "upgrade" ? " upgrade" : ""} – ${want.why} (${fmt(I.gold)}/${fmt(action.cost)})`;
+        brain.plan = `Saving for ${want.type}${action.kind === "upgrade" ? " upgrade" : ""} – ${want.why} (${fmt(gold)}/${fmt(action.cost)})`;
         // Defense is urgent but not worth blocking the economy for.
         if (isDefense) continue;
-        return;
+        return 0;
       }
-      let ok;
       if (action.kind === "upgrade") {
-        ok = emit("upgrade", { unitId: action.id, unitType: want.type, amount: 1 });
-        if (ok) log(`Upgraded ${want.type} to level ${action.unit.level() + 1} (${want.why}) for ${fmt(action.cost)}`);
+        if (!emit("upgrade", { unitId: action.id, unitType: want.type, amount: action.amount })) continue;
+        upgraded.add(action.id);
+        log(
+          `Upgraded ${want.type} to level ${action.unit.level() + action.amount} (${want.why}) for ${fmt(action.cost)}`,
+        );
       } else {
-        ok = emit("build", { unit: want.type, tile: action.tile });
-        if (ok) log(`Building ${want.type} (${want.why}) for ${fmt(action.cost)}`);
+        if (!emit("build", { unit: want.type, tile: action.tile })) continue;
+        // Count it right away so the next purchase this cycle sees it.
+        const tile = action.tile;
+        I.mine[want.type].push({
+          tile: () => tile,
+          level: () => 1,
+          type: () => want.type,
+          isUnderConstruction: () => true,
+        });
+        log(`Building ${want.type} (${want.why}) for ${fmt(action.cost)}`);
       }
-      if (ok) {
-        brain.cd.mark("build");
-        return;
-      }
+      return action.cost;
     }
+    return 0;
   }
 
   // ----- nukes ---------------------------------------------------------------
@@ -1377,8 +1408,8 @@
       if (I.gold < cost * (type === UT.AtomBomb ? 1.3 : 1.1)) continue;
       if (emit("build", { unit: type, tile: best, rocketDirectionUp: true })) {
         brain.cd.mark("nuke");
-        // Follow up on land while their troops are down.
-        brain.nukeHit = { sid: target.smallID(), until: gameNow() + 40000 };
+        // Their land is fallout for a while: keep land attacks elsewhere.
+        brain.nukeHit = { sid: target.smallID(), until: gameNow() + 90000 };
         log(`☢ Launched ${type} at ${target.displayName()} (value ${bestVal})`);
         return;
       }
