@@ -1477,8 +1477,10 @@
     // Don't burn money on nukes while the economy is tiny.
     if (I.mine[UT.City].length < 2) return;
 
-    // Priority: silos of anyone rich enough to MIRV us (no silo, no MIRV).
-    for (const p of I.mirvThreats) {
+    // Priority: silos of anyone rich enough to MIRV us (no silo, no MIRV) -
+    // but only if they are already at war with us. Nations answer a nuke with
+    // nukes: striking a peaceful nuclear power cost a real game 930K troops.
+    for (const p of I.mirvThreats.filter((x) => I.attackers.has(x.smallID()))) {
       const sams = p.units(UT.SAMLauncher);
       const cfg0 = g.config();
       const silo = p
