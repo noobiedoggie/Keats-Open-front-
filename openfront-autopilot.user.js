@@ -177,6 +177,7 @@
     allianceRequest: /\bonSendAllianceRequest\s*\(/,
     allianceExtend: /\bonSendAllianceExtensionIntent\s*\(/,
     cancelAttack: /\bonCancelAttackIntentEvent\s*\(/,
+    deleteUnit: /\bonSendDeleteUnitIntent\s*\(/,
   };
 
   const hook = {
@@ -293,6 +294,8 @@
       this.review = null;
       this.spawn = null;
       this.spawnMoves = 0;
+      this.spawnFailed = 0;
+      this.randomSpawnLogged = false;
       this.nukeHit = null;
       this.lastTick = undefined;
     },
@@ -500,8 +503,11 @@
     }
     const difficulty = safe(() => g.config().gameConfig().difficulty, "Medium");
     const gap = { Easy: [2, 20], Medium: [1.5, 10], Hard: [1.25, 10], Impossible: [1.15, 8] }[difficulty] || [1.5, 10];
-    // Highest city level count that stays off the steamroll radar (with margin).
-    const cityLevelCap = nationsAlive > 0 ? Math.max(gap[1], Math.floor(runnerUpCities * gap[0] * 0.95)) : Infinity;
+    // Highest city level count that stays off the steamroll radar, with a 15%
+    // margin: the line drops whenever the runner-up loses cities.
+    const cityLevelCap = nationsAlive > 0 ? Math.max(gap[1], Math.floor(runnerUpCities * gap[0] * 0.85)) : Infinity;
+    // The line itself: at or above it the nations MIRV us.
+    const mirvLine = nationsAlive > 0 ? Math.max(gap[1] + 1, Math.ceil(runnerUpCities * gap[0])) : Infinity;
 
     // Leaderboard.
     const alive = g.players().filter((p) => p.isAlive());
@@ -545,6 +551,7 @@
       strongestOther,
       myCityLevels,
       cityLevelCap,
+      mirvLine,
       mirvThreats,
       immunity: safe(() => g.isSpawnImmunityActive(), false),
       nationImmunity: safe(() => g.isNationSpawnImmunityActive(), false),
@@ -664,8 +671,20 @@
   // Terrain decides how fast land falls: plains are cheapest to take.
   const TERRAIN_VALUE = [1.0, 0.75, 0.5]; // Plains, Highland, Mountain
 
+  /**
+   * Where the map's nations will appear. In solo the spawn phase ends the
+   * moment we pick, before they are on the map, so we read their planned
+   * spots from the map data the client already has (scaled for compact maps).
+   */
+  function plannedNationSpots(g) {
+    const list = safe(() => g._mapData.nations, null) || [];
+    return list
+      .filter((n) => Array.isArray(n.coordinates) && g.isValidCoord(n.coordinates[0], n.coordinates[1]))
+      .map((n) => ({ x: n.coordinates[0], y: n.coordinates[1] }));
+  }
+
   /** Score a spawn tile: free land we can actually reach, bots to eat, players to avoid. */
-  function scoreSpawn(g, start, mySid, ownerType) {
+  function scoreSpawn(g, start, mySid, ownerType, planned = []) {
     const R = 45; // look this far around
     const R2 = R * R;
     const sx = g.x(start),
@@ -707,12 +726,20 @@
     }
     // Some coast is good (ports, trade); a tiny island is not.
     const coastBonus = Math.min(coast, 120) * 0.5;
-    return land + bots + coastBonus - enemyNear * 40;
+    // Nations that have not spawned yet: the closer their planned spot, the
+    // worse (they expand fast and attack early).
+    let nationPenalty = 0;
+    for (const n of planned) {
+      const d = Math.hypot(n.x - sx, n.y - sy);
+      if (d < 150) nationPenalty += (1 - d / 150) * 2500;
+    }
+    return land + bots + coastBonus - enemyNear * 40 - nationPenalty;
   }
 
   function chooseSpawn(g, mySid) {
     const W = g.width(),
       H = g.height();
+    const planned = plannedNationSpots(g);
     const typeCache = new Map();
     const ownerType = (sid) => {
       if (!typeCache.has(sid)) {
@@ -741,26 +768,48 @@
           } else if (ownerType(no) !== PT.Bot) enemy++;
         }
       }
-      screened.push({ t, quick: free - enemy * 4 });
+      let near = 0;
+      for (const n of planned) if (Math.hypot(n.x - x, n.y - y) < 60) near++;
+      screened.push({ t, quick: free - enemy * 4 - near * 60 });
     }
     screened.sort((a, b) => b.quick - a.quick);
     // Stage 2: real evaluation of the best candidates.
     let best = null,
       bestScore = -Infinity;
     for (const c of screened.slice(0, 18)) {
-      const sc = scoreSpawn(g, c.t, mySid, ownerType);
+      const sc = scoreSpawn(g, c.t, mySid, ownerType, planned);
       if (sc > bestScore) {
         bestScore = sc;
         best = c.t;
       }
     }
-    return best === null ? null : { tile: best, score: bestScore, ownerType };
+    return best === null ? null : { tile: best, score: bestScore, ownerType, planned, ranked: screened };
   }
 
   function doSpawn(g) {
     if (!S.autoSpawn) {
       brain.plan = "Spawn phase (auto-spawn off)";
       return;
+    }
+    const meNow = g.myPlayer();
+    if (safe(() => g.config().isRandomSpawn(), false)) {
+      // The game places everyone at random; one intent is enough to join.
+      if (meNow && meNow.hasSpawned && meNow.hasSpawned()) {
+        brain.plan = "Random spawn is on in this game – placed by the game";
+        return;
+      }
+      if (!brain.cd.ready("spawn", 3000)) return;
+      brain.cd.mark("spawn");
+      emit("spawn", { tile: g.ref(Math.floor(g.width() / 2), Math.floor(g.height() / 2)) });
+      if (!brain.randomSpawnLogged) log("Random spawn is on in this game: the game picks the spot");
+      brain.randomSpawnLogged = true;
+      return;
+    }
+    // A spawn intent that did not take (tile refused): try the next best spot.
+    if (brain.spawn && !(meNow && meNow.hasSpawned && meNow.hasSpawned()) && gameNow() - brain.spawn.at > 3000) {
+      log("Spawn did not take – trying another spot");
+      brain.spawnFailed = (brain.spawnFailed || 0) + 1;
+      brain.spawn = null;
     }
     // Re-check every few seconds: nations keep spawning during this phase, and
     // the spawn can be moved until the game starts.
@@ -771,13 +820,19 @@
     const pick = chooseSpawn(g, mySid);
     if (!pick) return;
     if (brain.spawn) {
-      const current = scoreSpawn(g, brain.spawn.tile, mySid, pick.ownerType);
+      const current = scoreSpawn(g, brain.spawn.tile, mySid, pick.ownerType, pick.planned);
       brain.plan = `Spawned – spot score ${Math.round(current)}`;
       if (brain.spawnMoves >= 3 || pick.score < current * 1.3 + 50) return;
       log(`Moving spawn: better spot found (${Math.round(current)} → ${Math.round(pick.score)})`);
       brain.spawnMoves++;
     }
+    if (brain.spawnFailed) {
+      // Skip the spots that were refused.
+      const alt = pick.ranked[Math.min(pick.ranked.length - 1, brain.spawnFailed * 3)];
+      if (alt) pick.tile = alt.t;
+    }
     if (emit("spawn", { tile: pick.tile })) {
+      pick.at = gameNow();
       brain.spawn = pick;
       brain.plan = `Spawned – spot score ${Math.round(pick.score)}`;
       log(`Spawning at (${g.x(pick.tile)}, ${g.y(pick.tile)}), spot score ${Math.round(pick.score)}`);
@@ -1153,6 +1208,9 @@
     const WARSHIP_DANGER = 150;
     const W = g.width(),
       H = g.height();
+    // Play close: landings only within a short hop of our own coast.
+    const MAX_HOP = clamp(Math.max(W, H) * 0.12, 90, 260);
+    const ourShore = sampleArray(I.shore, 120);
     const cands = [];
     for (let i = 0; i < 3000 && cands.length < 220; i++) {
       const x = Math.floor(Math.random() * W),
@@ -1178,8 +1236,9 @@
         weakness = Math.min(3, odds) * (isBot ? 2.5 : 1);
       }
       if (enemyWarships.some((w) => dist(g, w, t) < WARSHIP_DANGER)) continue; // guarded coast
-      const d = Math.hypot(x - I.cx, y - I.cy);
-      cands.push({ t, score: weakness * 100 - d * 0.6 });
+      const d = minDist(g, t, ourShore, Infinity);
+      if (d > MAX_HOP) continue; // too far: stay local
+      cands.push({ t, score: weakness * 100 - d * 2 });
     }
     cands.sort((a, b) => b.score - a.score);
     for (const c of cands.slice(0, 5)) {
@@ -1483,6 +1542,31 @@
     return 0;
   }
 
+  // ----- staying under the MIRV line ---------------------------------------------
+  /**
+   * When conquests or a shrinking runner-up push our city levels over the
+   * nations' MIRV line, delete one well-chosen city (the game allows one
+   * deletion per 30s). A few cities cost far less than a MIRV, which wiped out
+   * 60% of our cities in real games.
+   */
+  function doCityTrim(I) {
+    if (!S.build || !hook.ctors.deleteUnit) return false;
+    if (I.myCityLevels < I.mirvLine || I.mirvThreats.length === 0) return false;
+    if (!brain.cd.ready("trim", 31000)) return false;
+    const over = I.myCityLevels - I.mirvLine + 1;
+    const cities = I.mine[UT.City].filter((u) => u.id && !u.isUnderConstruction());
+    if (cities.length === 0) return false;
+    // Smallest city that covers the overshoot on its own, else the biggest.
+    cities.sort((a, b) => a.level() - b.level());
+    const pick = cities.find((u) => u.level() >= over) || cities[cities.length - 1];
+    if (emit("deleteUnit", { unitId: pick.id() })) {
+      brain.cd.mark("trim");
+      log(`Deleting a level ${pick.level()} city: ${I.myCityLevels} city levels is over the MIRV line (${I.mirvLine})`);
+      return true;
+    }
+    return false;
+  }
+
   // ----- nukes ---------------------------------------------------------------
   async function doNukes(g, me, I, strat) {
     if (!S.nukes || I.immunity) return;
@@ -1543,10 +1627,10 @@
     if (hostile.length === 0) return;
     // Who: whoever is attacking us, else the strongest hostile neighbour,
     // else (endgame) the biggest rival anywhere.
+    // Play close: only neighbours and players attacking us are nuke targets.
     const threatScore = (p) =>
       (I.attackers.get(p.smallID()) || 0) * 3 +
-      (neighborIDs.has(p.smallID()) ? num(p.troops()) : 0) +
-      (strat.stance === "Endgame" ? p.numTilesOwned() * 5 : 0);
+      (neighborIDs.has(p.smallID()) ? num(p.troops()) + (strat.stance === "Endgame" ? p.numTilesOwned() * 5 : 0) : 0);
     hostile.sort((a, b) => threatScore(b) - threatScore(a));
     const target = hostile[0];
     if (threatScore(target) <= 0) return;
@@ -1836,6 +1920,7 @@
         if (!attacked) await doBoat(g, me, I, policy, strat);
       }
       await doNukes(g, me, I, strat);
+      doCityTrim(I);
       await doBuild(g, me, I, policy, strat);
     } catch (e) {
       console.warn("[OpenFront Autopilot]", e);
