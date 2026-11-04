@@ -934,6 +934,16 @@
         if (!brain.cd.ready(key, 2500)) continue;
         const available = Math.max(0, I.troops - I.maxTroops * 0.05);
         if (available < incomingTroops * 0.3) continue; // hopeless: keep troops as defenders
+        // Block only when it is the better trade. Left alone, an attack pays
+        // ~80 x min(2, ourArmy/theirs) x (0.35 + 0.0039 x ourDensity) troops per
+        // tile while we lose only ourDensity per tile; blocking costs 1:1.
+        // A real game was lost blocking ~60 small waves 1:1 with a big empire.
+        const density = I.troops / Math.max(1, I.land);
+        const lossPerTile = 80 * clamp(I.troops / Math.max(1, incomingTroops), 0.6, 2) * (0.35 + 0.0039 * density);
+        const tilesLost = incomingTroops / lossPerTile;
+        const ourLossIfDefended = tilesLost * density;
+        const worthBlocking = tilesLost > I.land * 0.03 || ourLossIfDefended > incomingTroops * 0.6;
+        if (!worthBlocking) continue; // let it break on our land
         let amount = Math.min(available, incomingTroops * 1.05);
         // Their army is out of the house: hit back for real, but never empty
         // ours. (A real game was lost by answering a 200K attack with our
