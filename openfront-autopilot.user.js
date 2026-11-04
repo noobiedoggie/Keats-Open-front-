@@ -1059,6 +1059,25 @@
     return false;
   }
 
+  /** Debug: why each player neighbour is or isn't being attacked right now. */
+  function explain() {
+    const I = brain.intel;
+    if (!I || !I.policy || !I.strat) return "no intel yet";
+    return I.neighbors
+      .filter((n) => n.type !== PT.Bot)
+      .map((n) => ({
+        name: n.p.displayName(),
+        troops: Math.round(n.troops / 10),
+        friendly: n.friendly,
+        allied: n.allied,
+        dangerous: I.strat.dangerous.includes(n),
+        nuked: !!(brain.nukeHit && brain.nukeHit.sid === n.sid && gameNow() < brain.nukeHit.until),
+        need: +strengthNeeded(I.policy, n).toFixed(2),
+        ourRatio: +(I.troops / Math.max(1, n.troops)).toFixed(2),
+        score: +scoreTarget(I, n, I.policy.sendable, I.policy, I.strat).toFixed(2),
+      }));
+  }
+
   // ----- naval invasions -----------------------------------------------------
   async function doBoat(g, me, I, policy, strat) {
     if (!S.boats || I.shore.length === 0) return false;
@@ -1089,6 +1108,8 @@
       if (!g.isLand(t) || !g.isShore(t)) continue;
       const o = g.ownerID(t);
       if (o === I.myID) continue;
+      // Nuked land is ownerless fallout, not free land (2.5-5x losses).
+      if (o === 0 && safe(() => g.hasFallout(t), false)) continue;
       let weakness = 3; // unclaimed
       if (o !== 0) {
         const p = safe(() => g.playerBySmallID(o), null);
@@ -1116,11 +1137,22 @@
         log(`Skipped a naval landing at (${g.x(c.t)}, ${g.y(c.t)}): enemy warships guard the route`);
         continue;
       }
-      if (emit("boat", { dst: c.t, troops: amount })) {
+      // Send what the landing needs, not everything: free land costs ~20
+      // troops a tile, a player needs ~1.75x its army.
+      const o2 = g.ownerID(c.t);
+      const atSea = I.mine[UT.Transport].length;
+      const boatAmount = Math.floor(
+        o2 === 0
+          ? Math.min(amount, I.maxTroops * 0.15)
+          : Math.min(amount, num(safe(() => g.playerBySmallID(o2).troops(), amount)) * 1.75),
+      );
+      if (atSea > 0 && o2 === 0) continue; // one free-land landing at a time
+      if (boatAmount < I.maxTroops * 0.03) continue;
+      if (emit("boat", { dst: c.t, troops: boatAmount })) {
         const o = g.ownerID(c.t);
         const who = o === 0 ? "free land" : safe(() => g.playerBySmallID(o).displayName(), "enemy");
         brain.target = who + " (by sea)";
-        log(`Naval invasion of ${who} at (${g.x(c.t)}, ${g.y(c.t)}) with ${fmtTroops(amount)}`);
+        log(`Naval invasion of ${who} at (${g.x(c.t)}, ${g.y(c.t)}) with ${fmtTroops(boatAmount)}`);
         return true;
       }
     }
@@ -2028,7 +2060,7 @@
         : "Loaded. Join or start a game, then press START (Shift+B).",
     );
     // Exposed for debugging from the devtools console.
-    window.ofAutopilot = { settings: S, stats: STATS, brain, hook, solo, think };
+    window.ofAutopilot = { settings: S, stats: STATS, brain, hook, solo, think, explain };
   }
   boot();
 })();
