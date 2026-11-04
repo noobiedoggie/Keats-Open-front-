@@ -629,7 +629,7 @@
     // troops, and troops regrow fastest when the army is low.
     const expandFloor = (0.22 - aggr * 0.01) * I.maxTroops; // 21% .. 12%
     const safeSendable = Math.max(0, I.troops - Math.max(expandFloor, homeGuard * 0.9));
-    return { reserve, trigger, threat, sendable, safeSendable, homeGuard, expandFloor, aggr };
+    return { reserve, trigger, threat, sendable, safeSendable, homeGuard, homeFactor, expandFloor, aggr };
   }
 
   // ----- spawn -------------------------------------------------------------------
@@ -1003,33 +1003,50 @@
 
     // 3) Players: only when clearly stronger, never all-in.
     if (!S.attackPlayers) return false;
-    if (I.ratio < policy.trigger && !overflow) return false;
-    const send = Math.floor(policy.sendable);
-    if (send < I.maxTroops * 0.05) return false;
+    // What we can afford to send at target n: keep enough home for n itself
+    // (60% of its army, defenders fight with an advantage), for every other
+    // player next door, and the leader's anti-MIRV reserve. This is sized to
+    // the real threats instead of a % of our (huge, late-game) troop cap.
+    const affordable = (n) => {
+      const others = I.neighbors.filter((x) => x !== n && isPlayerNeighbor(x));
+      const otherGuard = Math.min(
+        others.reduce((m, x) => Math.max(m, x.troops), 0) * policy.homeFactor,
+        I.troops * 0.6,
+      );
+      const keepHome =
+        Math.max(
+          n.troops * 0.6,
+          otherGuard,
+          I.maxTroops * 0.15,
+          strat.leader && I.enemySilos > 0 ? I.maxTroops * 0.4 : 0,
+        ) + I.incomingTroops;
+      return Math.max(0, I.troops - keepHome);
+    };
     let best = null,
       bestScore = 0;
     for (const n of I.neighbors) {
       if (n.type === PT.Bot) continue;
-      const sc = scoreTarget(I, n, send, policy, strat);
+      const sc = scoreTarget(I, n, affordable(n), policy, strat);
       if (sc > bestScore) {
         bestScore = sc;
         best = n;
       }
     }
-    const minScore = overflow ? 0.6 : 1.2 - aggr * 0.05; // 1.15 .. 0.7
-    if (!best || bestScore < minScore) return false;
-    // Keep enough at home that the target cannot simply counter-attack.
-    const keepHome = Math.max(best.troops * 0.7, policy.homeGuard);
+    if (!best) return false;
+    const outnumber = I.troops > best.troops * 1.3;
+    // Below the trigger we normally keep growing, unless we already clearly
+    // outnumber them (then waiting only lets them grow too).
+    if (I.ratio < policy.trigger && !overflow && !outnumber) return false;
+    const minScore = overflow || outnumber ? 0.6 : 1.2 - aggr * 0.05; // 1.15 .. 0.7
+    if (bestScore < minScore) return false;
     // Attacker losses per tile are lowest once the stack is >= 1.7x the
     // defender's whole army (the game's CHEAPEST_TROOP_RATIO of 0.6).
     const amount = Math.floor(
-      Math.min(send, I.troops - keepHome, best.troops * (1.75 + Math.min(1, best.posts * 0.1))),
+      Math.min(affordable(best), best.troops * (1.75 + Math.min(1, best.posts * 0.1))),
     );
-    // At the troop cap growth has stopped, so idle troops are wasted: when we
-    // clearly outnumber them overall, a smaller stack is acceptable (blocked
-    // counter-attacks cost them as much as us).
-    const atCapAndStronger = overflow && I.troops > best.troops * 1.4;
-    const minStack = best.troops * (atCapAndStronger ? 0.9 : 1.2);
+    // When we clearly outnumber them a smaller stack still wins: blocked
+    // counter-attacks cost them as much as us.
+    const minStack = best.troops * (outnumber ? 0.9 : 1.2);
     if (amount < minStack || amount < I.maxTroops * 0.05) return false;
     if (emit("attack", { targetID: best.p.id(), troops: amount })) {
       brain.cd.mark("attack");
