@@ -350,6 +350,7 @@
     const neighborCount = new Map(); // smallID -> number of border contacts
     const neighborTiles = new Map(); // smallID -> sample of their touching tiles
     let unclaimedContacts = 0;
+    let falloutContacts = 0;
     const shore = [];
     let minX = Infinity,
       minY = Infinity,
@@ -367,7 +368,12 @@
         const o = g.ownerID(n);
         if (o === myID) continue;
         if (o === 0) {
-          if (g.isLand(n) && !safe(() => g.isImpassable(n), false)) unclaimedContacts++;
+          if (g.isLand(n) && !safe(() => g.isImpassable(n), false)) {
+            // Nuked land is ownerless but full of fallout: the engine makes it
+            // 2.5-5x more expensive to take, so it does not count as free land.
+            if (safe(() => g.hasFallout(n), false)) falloutContacts++;
+            else unclaimedContacts++;
+          }
           continue;
         }
         neighborCount.set(o, (neighborCount.get(o) || 0) + 1);
@@ -499,6 +505,7 @@
       owned,
       neighbors,
       unclaimedContacts,
+      falloutContacts,
       incoming,
       outgoing,
       incomingTroops,
@@ -763,7 +770,8 @@
         // to eat (an alliance would block the expansion). Distant or strong ones
         // are free safety.
         if (hitting > I.troops * 0.5) continue;
-        if (isNeighbor && theirs < I.troops * 0.35 && strat.threat < 0.3) {
+        const preyRatio = strat.stance === "Endgame" ? 0.7 : 0.35;
+        if (isNeighbor && theirs < I.troops * preyRatio && strat.threat < 0.3) {
           log(`Ignored alliance from weak neighbour ${p.displayName()} (prey)`);
           continue;
         }
@@ -781,7 +789,11 @@
       if (!other) continue;
       brain.cd.mark(key);
       const n = neighborBySid.get(other.smallID());
-      if (n && n.troops < I.troops * 0.3 && strat.stance !== "Defense") {
+      const theirs = num(other.troops());
+      // To win a free-for-all, everyone has to go eventually: drop allies we
+      // clearly outclass (always when they border us, in the endgame anywhere).
+      const outclass = theirs < I.troops * (strat.stance === "Endgame" ? 0.6 : 0.4);
+      if (strat.stance !== "Defense" && outclass && (n || strat.stance === "Endgame")) {
         log(`Letting alliance with ${other.displayName()} expire – they are next`);
         continue;
       }
@@ -923,7 +935,14 @@
         const theirHome = num(p.troops());
         const keepHome = Math.max(theirHome * 1.1, policy.homeGuard, I.maxTroops * 0.3);
         const spare = I.troops - amount - keepHome;
-        if (S.attackPlayers && theirHome < I.troops * 0.5 && spare >= theirHome * 1.7 && spare >= I.maxTroops * 0.05) {
+        const recentlyNuked = brain.nukeHit && brain.nukeHit.sid === sid && gameNow() < brain.nukeHit.until;
+        if (
+          S.attackPlayers &&
+          !recentlyNuked &&
+          theirHome < I.troops * 0.5 &&
+          spare >= theirHome * 1.7 &&
+          spare >= I.maxTroops * 0.05
+        ) {
           amount += Math.min(spare, theirHome * 2);
         }
         amount = Math.floor(amount);
@@ -954,7 +973,12 @@
     // every few seconds (attacks on the same target merge in the game).
     if (S.expand && I.unclaimedContacts > 0 && brain.cd.ready("expand", 1500 + (10 - aggr) * 150)) {
       const opening = !brain.openingSent;
-      let amount = opening ? I.troops * 0.5 : policy.safeSendable;
+      // Free land costs only ~16-25 troops per tile, so a modest stack is
+      // enough; topping up a huge one just parks troops that stop regrowing.
+      const expanding = I.outgoing
+        .filter((a) => a.targetID === 0)
+        .reduce((sum, a) => sum + num(a.troops), 0);
+      let amount = opening ? I.troops * 0.5 : Math.min(policy.safeSendable, I.maxTroops * 0.3 - expanding);
       if (strat.bots.length > 0 && !opening) amount *= 0.6; // leave some for the bot hunt
       amount = Math.floor(amount);
       if (amount >= I.maxTroops * 0.03) {
@@ -994,7 +1018,12 @@
     const amount = Math.floor(
       Math.min(send, I.troops - keepHome, best.troops * (1.75 + Math.min(1, best.posts * 0.1))),
     );
-    if (amount < best.troops * 1.2 || amount < I.maxTroops * 0.05) return false;
+    // At the troop cap growth has stopped, so idle troops are wasted: when we
+    // clearly outnumber them overall, a smaller stack is acceptable (blocked
+    // counter-attacks cost them as much as us).
+    const atCapAndStronger = overflow && I.troops > best.troops * 1.4;
+    const minStack = best.troops * (atCapAndStronger ? 0.9 : 1.2);
+    if (amount < minStack || amount < I.maxTroops * 0.05) return false;
     if (emit("attack", { targetID: best.p.id(), troops: amount })) {
       brain.cd.mark("attack");
       brain.target = best.p.displayName();
