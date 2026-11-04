@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront Autopilot
 // @namespace    https://github.com/noobiedoggie/keats-open-front-
-// @version      2.2.0
+// @version      2.3.0
 // @description  Fully hands-off autopilot + intel HUD for OpenFront.io: starts solo games, spawns, expands, wages war, builds, defends, nukes and requeues by itself.
 // @author       Keats
 // @match        https://openfront.io/*
@@ -274,6 +274,7 @@
     allianceAsked: new Map(), // playerID -> tick we last asked
     troopHistory: new Map(), // smallID -> [{tick, troops}] for trend detection
     gameEndHandled: false,
+    openingSent: false,
     reset() {
       this.cd.reset();
       this.intel = null;
@@ -283,6 +284,8 @@
       this.allianceAsked.clear();
       this.troopHistory.clear();
       this.gameEndHandled = false;
+      this.openingSent = false;
+      this.review = null;
     },
   };
 
@@ -503,7 +506,13 @@
   /** Reads the situation and picks a stance plus an effective aggression. */
   function chooseStrategy(I) {
     const threat = I.troops > 0 ? I.incomingTroops / I.troops : 0;
-    const players = I.neighbors.filter(isPlayerNeighbor);
+    // Players that can actually hit us right now (spawn immunity protects us).
+    const players = I.neighbors.filter(
+      (n) =>
+        isPlayerNeighbor(n) &&
+        !(I.immunity && n.type === PT.Human) &&
+        !(I.nationImmunity && n.type === PT.Nation),
+    );
     const bots = I.neighbors.filter((n) => !n.friendly && n.type === PT.Bot);
     const biggestPlayer = players.reduce((m, n) => Math.max(m, n.troops), 0);
     // A neighbour at least as strong as us that is not busy fighting someone else.
@@ -579,10 +588,12 @@
     const homeGuard = Math.min(strat.biggestPlayer * homeFactor, I.troops * 0.6) + I.incomingTroops;
     // Troops free for player wars: above both the growth reserve and the guard.
     const sendable = Math.max(0, I.troops - Math.max(reserve * I.maxTroops, homeGuard));
-    // Troops free for bots / free land: no counter-attack risk from them, so
-    // only the home guard and a small floor are kept.
-    const safeSendable = Math.max(0, I.troops - Math.max(0.12 * I.maxTroops, homeGuard * 0.9));
-    return { reserve, trigger, threat, sendable, safeSendable, homeGuard, aggr };
+    // Troops free for bots / free land. The game's own nations keep only
+    // 10-20% of their cap when grabbing land, so we do the same: land is max
+    // troops, and troops regrow fastest when the army is low.
+    const expandFloor = (0.22 - aggr * 0.01) * I.maxTroops; // 21% .. 12%
+    const safeSendable = Math.max(0, I.troops - Math.max(expandFloor, homeGuard * 0.9));
+    return { reserve, trigger, threat, sendable, safeSendable, homeGuard, expandFloor, aggr };
   }
 
   // ----- spawn -------------------------------------------------------------------
@@ -591,6 +602,13 @@
       H = g.height();
     let best = null,
       bestScore = -Infinity;
+    const typeCache = new Map();
+    const ownerType = (sid) => {
+      if (!typeCache.has(sid)) {
+        typeCache.set(sid, safe(() => g.playerBySmallID(sid).type(), PT.Nation));
+      }
+      return typeCache.get(sid);
+    };
     for (let i = 0; i < 1500; i++) {
       const x = Math.floor(Math.random() * W);
       const y = Math.floor(Math.random() * H);
@@ -599,20 +617,25 @@
       if (safe(() => g.isImpassable(t), false)) continue;
       let land = 0,
         enemy = 0,
+        bots = 0,
         water = 0;
-      for (let dy = -16; dy <= 16; dy += 2) {
-        for (let dx = -16; dx <= 16; dx += 2) {
+      for (let dy = -20; dy <= 20; dy += 2) {
+        for (let dx = -20; dx <= 20; dx += 2) {
           const nx = x + dx,
             ny = y + dy;
           if (!g.isValidCoord(nx, ny)) continue;
           const n = g.ref(nx, ny);
-          if (g.ownerID(n) !== 0) enemy++;
-          else if (g.isLand(n)) land++;
+          const o = g.ownerID(n);
+          if (o !== 0) {
+            if (ownerType(o) === PT.Bot) bots++;
+            else enemy++;
+          } else if (g.isLand(n)) land++;
           else water++;
         }
       }
-      // Lots of free land, nobody close, a little coast for trade.
-      const score = land - enemy * 5 + (water > 0 && water < 50 ? 18 : 0);
+      // Lots of free land, bots to eat (easy land + all their gold), no real
+      // player close by, a little coast for trade.
+      const score = land + bots * 0.8 - enemy * 6 + (water > 0 && water < 60 ? 18 : 0);
       if (score > bestScore) {
         bestScore = score;
         best = t;
@@ -797,20 +820,34 @@
   function doAttack(g, me, I, policy, strat) {
     const aggr = policy.aggr;
 
-    // Counter-attack: someone sent their army at us and left home empty.
-    if (S.defend && S.attackPlayers && I.attackers.size > 0 && brain.cd.ready("counter", 6000)) {
-      const spare = Math.max(0, I.troops - Math.max(I.incomingTroops * 1.1, I.maxTroops * 0.15));
-      for (const n of I.neighbors) {
-        if (n.friendly || !I.attackers.has(n.sid)) continue;
-        if (n.type === PT.Human && !S.attackHumans) continue;
-        if (I.outgoing.some((a) => a.targetID === n.sid)) continue;
-        if (spare < n.troops * 1.5 || spare < I.maxTroops * 0.05) continue;
-        const amount = Math.floor(Math.min(spare, n.troops * 2.5));
-        if (emit("attack", { targetID: n.p.id(), troops: amount })) {
-          brain.cd.mark("counter");
-          brain.cd.mark("attack");
-          brain.target = n.p.displayName();
-          log(`Counter-attacking ${n.p.displayName()} (home army ${fmtTroops(n.troops)}) with ${fmtTroops(amount)}`);
+    // 0) Defence. In OpenFront, attacking the player who attacks you cancels
+    // both attacks out troop for troop, before they take any land. So every
+    // incoming attack is answered at once with a matching attack; if their
+    // home is empty on top of that, the surplus becomes a real counter-attack.
+    if (S.defend && I.attackers.size > 0) {
+      for (const [sid, incomingTroops] of I.attackers) {
+        const p = safe(() => g.playerBySmallID(sid), null);
+        if (!p || !p.isPlayer() || safe(() => me.isFriendly(p), false)) continue;
+        if (p.type() === PT.Human && !S.attackHumans) continue;
+        const key = "cancel:" + sid;
+        if (!brain.cd.ready(key, 2500)) continue;
+        const available = Math.max(0, I.troops - I.maxTroops * 0.05);
+        if (available < incomingTroops * 0.3) continue; // hopeless: keep troops as defenders
+        let amount = Math.min(available, incomingTroops * 1.05);
+        // Their army is out of the house: hit back for real.
+        const theirHome = num(p.troops());
+        const spare = available - amount;
+        if (S.attackPlayers && spare >= theirHome * 1.7 && spare >= I.maxTroops * 0.05) {
+          amount += Math.min(spare, theirHome * 2.5);
+        }
+        amount = Math.floor(amount);
+        if (emit("attack", { targetID: p.id(), troops: amount })) {
+          brain.cd.mark(key);
+          brain.target = p.displayName();
+          log(
+            `Blocking ${p.displayName()}'s attack (${fmtTroops(incomingTroops)}) with ${fmtTroops(amount)}` +
+              (amount > incomingTroops * 1.2 ? " + counter-attack" : ""),
+          );
           return true;
         }
       }
@@ -825,22 +862,27 @@
 
     // Near the cap troops stop growing, so anything above it is wasted.
     const overflow = I.ratio >= 0.9;
-    if (!brain.cd.ready("attack", 2500 + (10 - aggr) * 350)) return false;
 
-    // 2) Unclaimed land: no one fights back, only the home guard is kept.
-    if (S.expand && I.unclaimedContacts > 0 && (I.ratio >= policy.trigger * 0.85 || overflow)) {
-      const alreadyExpanding = I.outgoing.some((a) => a.targetID === 0);
-      const send = Math.floor(policy.safeSendable);
-      if ((!alreadyExpanding || I.ratio > policy.trigger + 0.15) && send >= I.maxTroops * 0.05) {
-        const amount = Math.floor(send * (strat.bots.length > 0 ? 0.5 : I.neighbors.length > 0 ? 0.6 : 0.85));
+    // 2) Unclaimed land, like the game's nations do it: half the army goes out
+    // the moment the game starts, then everything above the expansion floor
+    // every few seconds (attacks on the same target merge in the game).
+    if (S.expand && I.unclaimedContacts > 0 && brain.cd.ready("expand", 2000 + (10 - aggr) * 200)) {
+      const opening = !brain.openingSent;
+      let amount = opening ? I.troops * 0.5 : policy.safeSendable;
+      if (strat.bots.length > 0 && !opening) amount *= 0.6; // leave some for the bot hunt
+      amount = Math.floor(amount);
+      if (amount >= I.maxTroops * 0.03) {
         if (emit("attack", { targetID: null, troops: amount })) {
-          brain.cd.mark("attack");
+          brain.cd.mark("expand");
+          brain.openingSent = true;
           brain.target = "free land";
-          log(`Expanding into free land with ${fmtTroops(amount)} troops`);
+          log(`${opening ? "Opening rush: " : ""}expanding into free land with ${fmtTroops(amount)} troops`);
           return true;
         }
       }
     }
+
+    if (!brain.cd.ready("attack", 2500 + (10 - aggr) * 350)) return false;
 
     // 3) Players: only when clearly stronger, never all-in.
     if (!S.attackPlayers) return false;
@@ -861,8 +903,10 @@
     if (!best || bestScore < minScore) return false;
     // Keep enough at home that the target cannot simply counter-attack.
     const keepHome = Math.max(best.troops * 0.7, policy.homeGuard);
+    // Attacker losses per tile are lowest once the stack is >= 1.7x the
+    // defender's whole army (the game's CHEAPEST_TROOP_RATIO of 0.6).
     const amount = Math.floor(
-      Math.min(send, I.troops - keepHome, best.troops * (1.6 + Math.min(1, best.posts * 0.1))),
+      Math.min(send, I.troops - keepHome, best.troops * (1.75 + Math.min(1, best.posts * 0.1))),
     );
     if (amount < best.troops * 1.2 || amount < I.maxTroops * 0.05) return false;
     if (emit("attack", { targetID: best.p.id(), troops: amount })) {
@@ -961,6 +1005,17 @@
       wants.push({ type: UT.SAMLauncher, why: "enemies have nukes" });
     }
     if (C === 0) wants.push({ type: UT.City, why: "first city" });
+    // A strong player next door: fortify that border right after the first city.
+    if (S.defend && C >= 1 && (strat.massing || strat.careful) && D < 2 + strat.dangerous.length) {
+      wants.push({
+        type: UT.DefensePost,
+        why: strat.careful ? "strong player next door" : "neighbour massing troops",
+        proactive: true,
+      });
+    }
+    // Each city level adds 250K max troops: by far the best buy in the game.
+    // Keep at least as many cities as ports + factories.
+    if (C < 2 || C <= P + F) wants.push({ type: UT.City, why: "+250K max troops", cityChoice: true });
     if (coastal && P < Math.max(1, Math.round(C * 0.75))) {
       wants.push({ type: UT.Port, why: "trade income" });
     }
@@ -971,13 +1026,6 @@
       wants.push({ type: UT.Factory, why: "train income" });
     }
     // Fortify the border with a neighbour that is massing an army.
-    if (S.defend && C >= 1 && (strat.massing || strat.careful) && D < 2 + strat.dangerous.length) {
-      wants.push({
-        type: UT.DefensePost,
-        why: strat.careful ? "strong player next door" : "neighbour massing troops",
-        proactive: true,
-      });
-    }
     if (S.nukes && C >= 3 && M < (I.landShare > 0.2 ? 2 : 1)) {
       wants.push({ type: UT.MissileSilo, why: "nuclear option" });
     }
@@ -1233,6 +1281,71 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Game review: remember how the game went, and explain the result
+  // ---------------------------------------------------------------------------
+  const REVIEW_KEY = "ofAutopilot.lastReview.v1";
+  let lastReview = safe(() => JSON.parse(localStorage.getItem(REVIEW_KEY) || "null"), null);
+
+  function recordGame(g, me, I) {
+    const r = (brain.review ||= { snaps: [], attackers: {}, peakShare: 0, bestRank: 99 });
+    r.peakShare = Math.max(r.peakShare, I.landShare);
+    r.bestRank = Math.min(r.bestRank, I.rank);
+    r.last = {
+      t: Math.round(I.secondsIn),
+      share: I.landShare,
+      troops: I.troops,
+      maxTroops: I.maxTroops,
+      gold: I.gold,
+      cities: I.mine[UT.City].length,
+      rank: I.rank,
+      players: I.playerCount,
+    };
+    if (brain.cd.ready("snap", 30000)) {
+      brain.cd.mark("snap");
+      r.snaps.push(r.last);
+    }
+    for (const [sid, troops] of I.attackers) {
+      const p = safe(() => g.playerBySmallID(sid), null);
+      if (!p || !p.isPlayer()) continue;
+      const a = (r.attackers[p.displayName()] ||= { max: 0, theirTroops: 0, type: p.type() });
+      a.max = Math.max(a.max, troops);
+      a.theirTroops = Math.max(a.theirTroops, num(p.troops()));
+    }
+  }
+
+  function buildReview(won, dead) {
+    const r = brain.review;
+    if (!r || !r.last) return null;
+    const L = r.last;
+    const tips = [];
+    const at = (sec) => r.snaps.find((s) => s.t >= sec);
+    const s2 = at(120);
+    if (s2 && s2.share < 0.01) tips.push("Slow opening: under 1% of the map after 2 minutes");
+    const s5 = at(300);
+    if (s5 && s5.cities < 3) tips.push(`Only ${s5.cities} cities after 5 minutes`);
+    if (L.gold > 1_500_000) tips.push(`Died with ${fmt(L.gold)} gold unspent`);
+    const worst = Object.entries(r.attackers).sort((a, b) => b[1].max - a[1].max)[0];
+    if (dead && worst) {
+      const [name, a] = worst;
+      if (a.theirTroops > L.troops * 1.5) {
+        tips.push(`Killed by ${name}, much stronger (${fmtTroops(a.theirTroops)} vs ${fmtTroops(L.troops)})`);
+      } else {
+        tips.push(`Lost the war against ${name} (biggest attack ${fmtTroops(a.max)})`);
+      }
+    }
+    if (!won && !dead) tips.push(`Game ended while we held ${(L.share * 100).toFixed(1)}% of the map`);
+    return {
+      result: won ? "Victory" : dead ? "Eliminated" : "Game over",
+      minutes: Math.round(L.t / 60),
+      peakShare: r.peakShare,
+      bestRank: r.bestRank,
+      players: L.players,
+      tips,
+      date: new Date().toLocaleString(),
+    };
+  }
+
+  // ---------------------------------------------------------------------------
   // Solo loop: start games from the homepage and requeue after each one
   // ---------------------------------------------------------------------------
   const solo = {
@@ -1331,6 +1444,12 @@
       saveStats();
     }
     log(won ? "🏆 Victory!" : dead ? "💀 Eliminated." : "Game over.");
+    const review = buildReview(won, dead);
+    if (review) {
+      lastReview = review;
+      saveJSON(REVIEW_KEY, review);
+      for (const t of review.tips) log("Review: " + t);
+    }
     if (S.enabled && S.soloLoop && isSolo) {
       log("Solo: back to the menu in 10s for the next game");
       setTimeout(() => {
@@ -1374,6 +1493,7 @@
       I.strat = strat;
       brain.intel = I;
       brain.strategy = strat.stance;
+      recordGame(g, me, I);
 
       if (!S.enabled) {
         brain.plan = "Autopilot OFF – showing intel only";
@@ -1465,6 +1585,7 @@
         <div class="muted" data-f="status"></div>
         <div data-f="plan" style="margin-top:2px"></div>
         <div data-f="intel"></div>
+        <div data-f="review"></div>
         <div class="sec">Solo mode (fully AFK)</div>
         <label>${checkbox("soloLoop")}Play solo games back-to-back</label>
         <div class="row" style="margin-top:4px"><span>Difficulty</span>
@@ -1678,6 +1799,12 @@
         ${I.enemySilos > 0 ? `<div class="warn">☢ Enemies own ${I.enemySilos} missile silo(s)</div>` : ""}
         ${I.enemyNavy > 0 ? `<div class="muted">⚓ ${I.enemyNavy} hostile ship(s) at sea</div>` : ""}`;
     }
+    q("review").innerHTML = lastReview
+      ? `<div class="sec">Last game review</div>
+         <div><b class="${lastReview.result === "Victory" ? "good" : "bad"}">${escapeHtml(lastReview.result)}</b>
+         <span class="muted">· ${lastReview.minutes} min · peak ${(lastReview.peakShare * 100).toFixed(1)}% of map · best rank ${lastReview.bestRank}/${lastReview.players}</span></div>
+         ${lastReview.tips.map((t) => `<div class="warn">• ${escapeHtml(t)}</div>`).join("") || '<div class="good">No obvious mistakes</div>'}`
+      : "";
     q("log").textContent = logLines.join("\n");
   }
 
