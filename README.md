@@ -10,6 +10,18 @@ A fully hands-off autopilot and intel HUD for [OpenFront.io](https://openfront.i
 3. Chrome may require **Developer mode** for userscripts (`chrome://extensions` → toggle top-right), and on newer versions you also need to turn on *Allow user scripts* in Tampermonkey's extension details.
 4. Reload openfront.io. A panel called **OpenFront Autopilot** appears on the right.
 
+## Android app
+
+The `android/` folder holds an Android app (Android 8+). It opens openfront.io full-screen and runs the same autopilot inside it. The panel, settings and solo mode all work as on desktop, with a touch-friendly layout.
+
+**Install:** on your phone, open the repository's **Releases** → **OpenFront Autopilot – Android (latest build)**. Download `OpenFrontAutopilot.apk` and open it. When Android asks, allow *Install unknown apps* for your browser. GitHub Actions rebuilds the APK every time the script or the app changes, and new versions install over the old one.
+
+**Notes:**
+- The app keeps the screen on while it's open. The bot only runs while the app is open on screen, so leave the phone on a charger.
+- The app doesn't use an accessibility service. It reads the game state directly, which is much more precise than tapping on the screen.
+- Google sign-in doesn't work inside apps like this (Google blocks it). Playing as a guest, or with Discord sign-in, works.
+- To build it yourself: `cd android && ./gradlew assembleDebug` (needs the Android SDK).
+
 ## Fully AFK solo mode
 
 1. In the panel, tick **Play solo games back-to-back** and pick a difficulty and a map (random or World).
