@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront Autopilot
 // @namespace    https://github.com/noobiedoggie/keats-open-front-
-// @version      2.4.0
+// @version      3.0.0
 // @description  Fully hands-off autopilot + intel HUD for OpenFront.io: starts solo games, spawns, expands, wages war, builds, defends, nukes and requeues by itself.
 // @author       Keats
 // @match        https://openfront.io/*
@@ -905,7 +905,7 @@
     if (n.land < I.land * 0.08) score *= 1.4; // finish off the nearly dead
     score /= 1 + n.posts * 0.08; // fortified players cost more
     const hittingUs = I.attackers.get(n.sid) || 0;
-    if (nuked) score *= 0.3;
+    if (nuked && I.troops < n.troops * 2) score *= 0.3; // fallout, unless we vastly outnumber them
     if (hittingUs > 0 && n.troops < I.troops) score *= 1.6; // revenge while they are committed
     if (n.trend > 0.35 && n.troops < I.troops) score *= 1.2; // strike before they finish massing
     // Stick to one war at a time.
@@ -1091,6 +1091,18 @@
         log(
           `Attacking ${best.p.displayName()} (${fmtTroops(best.troops)} troops vs our ${fmtTroops(I.troops)}) with ${fmtTroops(amount)}`,
         );
+        return true;
+      }
+    }
+
+    // Last resort at the troop cap: nothing else to do, so push through
+    // nuked land (2.5-5x dearer, but capped troops are wasted anyway).
+    if (overflow && I.unclaimedContacts === 0 && I.falloutContacts > 0 && !I.outgoing.some((a) => a.targetID === 0)) {
+      const amount = Math.floor(I.maxTroops * 0.25);
+      if (emit("attack", { targetID: null, troops: amount })) {
+        brain.cd.mark("attack");
+        brain.target = "fallout land";
+        log(`At the troop cap: pushing through nuked land with ${fmtTroops(amount)}`);
         return true;
       }
     }
@@ -1535,6 +1547,9 @@
     hostile.sort((a, b) => threatScore(b) - threatScore(a));
     const target = hostile[0];
     if (threatScore(target) <= 0) return;
+    // A target we outnumber 2.5x is cheaper to take by land, and nukes would
+    // only raise a fallout wall between us (a real game stalled 30 min so).
+    if (I.troops > num(target.troops()) * 2.5) return;
 
     const cfg = g.config();
     const sams = target.units(UT.SAMLauncher);
