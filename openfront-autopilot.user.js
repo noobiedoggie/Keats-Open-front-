@@ -478,6 +478,31 @@
       if (tt !== undefined && g.ownerID(tt) === myID && isHostileOwner(u)) nukesAtUs++;
     }
 
+    // MIRV radar. The game's nations MIRV a "steamrolling" leader whose city
+    // levels reach a multiple of the runner-up's (Medium 1.5x, Hard 1.25x...).
+    // Staying just under that line avoids those strikes entirely.
+    const cityLevels = (p) => safe(() => p.units(UT.City).reduce((sum, u) => sum + u.level(), 0), 0);
+    const myCityLevels = cityLevels(me);
+    let runnerUpCities = 0;
+    let nationsAlive = 0;
+    const mirvThreats = []; // hostile players with a silo and MIRV money
+    for (const p of g.players()) {
+      if (p === me || !p.isAlive()) continue;
+      if (p.type() === PT.Nation) nationsAlive++;
+      runnerUpCities = Math.max(runnerUpCities, cityLevels(p));
+      if (
+        !safe(() => me.isFriendly(p), false) &&
+        safe(() => p.units(UT.MissileSilo).length, 0) > 0 &&
+        num(safe(() => p.gold(), 0)) >= 15_000_000
+      ) {
+        mirvThreats.push(p);
+      }
+    }
+    const difficulty = safe(() => g.config().gameConfig().difficulty, "Medium");
+    const gap = { Easy: [2, 20], Medium: [1.5, 10], Hard: [1.25, 10], Impossible: [1.15, 8] }[difficulty] || [1.5, 10];
+    // Highest city level count that stays off the steamroll radar (with margin).
+    const cityLevelCap = nationsAlive > 0 ? Math.max(gap[1], Math.floor(runnerUpCities * gap[0] * 0.95)) : Infinity;
+
     // Leaderboard.
     const alive = g.players().filter((p) => p.isAlive());
     alive.sort((a, b) => b.numTilesOwned() - a.numTilesOwned());
@@ -518,6 +543,9 @@
       rank,
       playerCount: alive.length,
       strongestOther,
+      myCityLevels,
+      cityLevelCap,
+      mirvThreats,
       immunity: safe(() => g.isSpawnImmunityActive(), false),
       nationImmunity: safe(() => g.isNationSpawnImmunityActive(), false),
       secondsIn: safe(() => g.elapsedGameSeconds(), 0),
@@ -1210,7 +1238,8 @@
     }
     // Each city level adds 250K max troops: by far the best buy in the game.
     // Keep at least as many cities as ports + factories.
-    if (C < 2 || C <= P + F) wants.push({ type: UT.City, why: "+250K max troops", cityChoice: true });
+    const underRadar = I.myCityLevels < I.cityLevelCap;
+    if (underRadar && (C < 2 || C <= P + F)) wants.push({ type: UT.City, why: "+250K max troops", cityChoice: true });
     // Nuclear program as early as the economy allows: a silo right after the
     // first two cities, then a SAM so enemy nukes can't wipe us out.
     if (S.nukes && C >= 2 && M === 0) wants.push({ type: UT.MissileSilo, why: "nuclear program" });
@@ -1239,7 +1268,13 @@
         optional: !(strat.leader && I.gold > 5_000_000),
       });
     }
-    wants.push({ type: UT.City, why: "grow economy", cityChoice: true });
+    if (underRadar) wants.push({ type: UT.City, why: "grow economy", cityChoice: true });
+    else {
+      // At the MIRV line: spend on air defence and income instead of cities.
+      if (S.defend) wants.push({ type: UT.SAMLauncher, why: "MIRV shield (city cap reached)", upgrade: true, optional: true });
+      if (coastal) wants.push({ type: UT.Port, why: "income (city cap reached)", optional: true });
+      wants.push({ type: UT.Factory, why: "income (city cap reached)", optional: true });
+    }
     return wants;
   }
 
@@ -1441,6 +1476,28 @@
     if (safe(() => me.readyMissileCount(), 1) <= 0) return;
     // Don't burn money on nukes while the economy is tiny.
     if (I.mine[UT.City].length < 2) return;
+
+    // Priority: silos of anyone rich enough to MIRV us (no silo, no MIRV).
+    for (const p of I.mirvThreats) {
+      const sams = p.units(UT.SAMLauncher);
+      const cfg0 = g.config();
+      const silo = p
+        .units(UT.MissileSilo)
+        .find(
+          (u) =>
+            !sams.some((sm) => dist(g, sm.tile(), u.tile()) <= safe(() => cfg0.samRange(sm.level()), 70)) &&
+            minDist(g, u.tile(), I.borderSample, Infinity) > NUKE_RADIUS[UT.AtomBomb] + 5,
+        );
+      if (!silo) continue;
+      const res = await me.buildables(silo.tile(), [UT.AtomBomb]);
+      const b = (res || []).find((x) => x.type === UT.AtomBomb);
+      if (!b || b.canBuild === false || I.gold < num(b.cost)) continue;
+      if (emit("build", { unit: UT.AtomBomb, tile: silo.tile(), rocketDirectionUp: true })) {
+        brain.cd.mark("nuke");
+        log(`☢ Atom bomb on ${p.displayName()}'s missile silo (they can afford a MIRV)`);
+        return;
+      }
+    }
 
     // Only nuke someone we are actually fighting (or, in the endgame, any
     // rival). Nuking a giant we just asked for peace would only provoke it.
@@ -2041,6 +2098,7 @@
         <div class="row"><span>Gold</span><span>${fmt(I.gold)}</span></div>
         <div class="row"><span>Land</span><span>${fmt(I.land)} tiles (${(I.landShare * 100).toFixed(1)}%) · rank ${I.rank}/${I.playerCount}</span></div>
         <div class="muted">🏙 ${m[UT.City].length} · ⚓ ${m[UT.Port].length} · 🏭 ${m[UT.Factory].length} · 🛡 ${m[UT.DefensePost].length} · 📡 ${m[UT.SAMLauncher].length} · 🚀 ${m[UT.MissileSilo].length} · 🚢 ${m[UT.Warship].length}</div>
+        ${Number.isFinite(I.cityLevelCap) ? `<div class="row"><span>City levels</span><span class="${I.myCityLevels >= I.cityLevelCap ? "warn" : "muted"}">${I.myCityLevels} / ${I.cityLevelCap} (MIRV line)</span></div>` : ""}
         <div class="sec">Neighbours (${I.neighbors.length})${I.unclaimedContacts > 0 ? ' <span class="good">+ free land</span>' : ""}</div>
         ${nbs || '<div class="muted">none</div>'}
         ${I.enemySilos > 0 ? `<div class="warn">☢ Enemies own ${I.enemySilos} missile silo(s)</div>` : ""}
