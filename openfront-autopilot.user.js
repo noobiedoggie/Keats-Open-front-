@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront Autopilot
 // @namespace    https://github.com/noobiedoggie/keats-open-front-
-// @version      2.1.0
+// @version      2.2.0
 // @description  Fully hands-off autopilot + intel HUD for OpenFront.io: starts solo games, spawns, expands, wages war, builds, defends, nukes and requeues by itself.
 // @author       Keats
 // @match        https://openfront.io/*
@@ -492,20 +492,40 @@
   }
 
   // ----- strategy -------------------------------------------------------------
+  // Priorities, in order:
+  //   1. Wipe out the bots (tribes) as fast as possible: free land, no risk.
+  //   2. Never get weaker than a dangerous player next door, because a stronger
+  //      neighbour WILL attack. Keep a home army sized to the biggest player
+  //      neighbour and fortify that border.
+  //   3. Attack players only when clearly stronger, and never all-in.
+  const isPlayerNeighbor = (n) => !n.friendly && n.type !== PT.Bot;
+
   /** Reads the situation and picks a stance plus an effective aggression. */
   function chooseStrategy(I) {
     const threat = I.troops > 0 ? I.incomingTroops / I.troops : 0;
-    const hostile = I.neighbors.filter((n) => !n.friendly);
-    const biggestHostile = hostile.reduce((m, n) => Math.max(m, n.troops), 0);
-    const massing = hostile.some((n) => n.trend > 0.35 && n.troops > I.troops * 0.8);
+    const players = I.neighbors.filter(isPlayerNeighbor);
+    const bots = I.neighbors.filter((n) => !n.friendly && n.type === PT.Bot);
+    const biggestPlayer = players.reduce((m, n) => Math.max(m, n.troops), 0);
+    // A neighbour at least as strong as us that is not busy fighting someone else.
+    const dangerous = players.filter(
+      (n) => n.troops > I.troops * 0.9 && n.busy < n.troops * 0.4,
+    );
+    const massing = players.some((n) => n.trend > 0.35 && n.troops > I.troops * 0.8);
+    const careful = dangerous.length > 0;
     let aggr = clamp(S.aggression, 1, 10);
     let stance;
     if (threat > 0.35) {
       stance = "Defense";
       if (S.adaptive) aggr -= 2;
+    } else if (careful) {
+      stance = "Careful";
+      if (S.adaptive) aggr -= 2;
     } else if (I.landShare > 0.3 || (I.rank === 1 && I.troops > I.strongestOther * 1.5)) {
       stance = "Endgame";
       if (S.adaptive) aggr += 2;
+    } else if (bots.length > 0) {
+      stance = "Bot hunt";
+      if (S.adaptive) aggr += 1;
     } else if (I.unclaimedContacts > 0 && I.secondsIn < 240) {
       stance = "Opening";
       if (S.adaptive) aggr += 1;
@@ -515,14 +535,24 @@
       stance = "Build-up";
       if (S.adaptive && massing) aggr -= 1;
     }
-    if (S.adaptive && biggestHostile > 0 && I.troops > biggestHostile * 2) aggr += 1;
-    return { stance, aggr: clamp(aggr, 1, 10), threat, massing };
+    if (S.adaptive && biggestPlayer > 0 && I.troops > biggestPlayer * 2) aggr += 1;
+    return {
+      stance,
+      aggr: clamp(aggr, 1, 10),
+      threat,
+      massing,
+      careful,
+      dangerous,
+      bots,
+      biggestPlayer,
+    };
   }
 
   // ----- troop policy -----------------------------------------------------------
   // Troop growth in OpenFront peaks around 40% of the cap and stops at the cap,
   // so the bot keeps its army in that band: it attacks once it climbs above a
-  // trigger and only sends what brings it back down to a reserve.
+  // trigger and only sends what brings it back down to a reserve. On top of
+  // that it always keeps a home army sized to the biggest player next door.
   function troopPolicy(I, strat) {
     const aggr = strat.aggr;
     let reserve = 0.42 - aggr * 0.025; // 0.395 (turtle) .. 0.17 (berserk)
@@ -540,8 +570,19 @@
     }
     reserve = clamp(reserve, 0.1, 0.7);
     trigger = clamp(trigger, reserve + 0.1, 0.95);
-    const sendable = Math.max(0, I.troops - reserve * I.maxTroops);
-    return { reserve, trigger, threat, sendable, aggr };
+
+    // Home army: defenders fight with an advantage, so ~60-80% of the biggest
+    // player neighbour's army (more when cautious) keeps them from trying.
+    const homeFactor = 0.85 - aggr * 0.03; // 0.82 .. 0.55
+    // Capped at 60% of our army: against a giant, hoarding everything would not
+    // save us anyway, while eating bots makes us bigger.
+    const homeGuard = Math.min(strat.biggestPlayer * homeFactor, I.troops * 0.6) + I.incomingTroops;
+    // Troops free for player wars: above both the growth reserve and the guard.
+    const sendable = Math.max(0, I.troops - Math.max(reserve * I.maxTroops, homeGuard));
+    // Troops free for bots / free land: no counter-attack risk from them, so
+    // only the home guard and a small floor are kept.
+    const safeSendable = Math.max(0, I.troops - Math.max(0.12 * I.maxTroops, homeGuard * 0.9));
+    return { reserve, trigger, threat, sendable, safeSendable, homeGuard, aggr };
   }
 
   // ----- spawn -------------------------------------------------------------------
@@ -649,8 +690,8 @@
     // Ask far stronger neighbours for peace so they pick someone else.
     if (S.requestAlliances && !I.immunity) {
       for (const n of I.neighbors) {
-        if (n.friendly) continue;
-        if (n.troops < I.troops * 1.6) continue;
+        if (n.friendly || n.type === PT.Bot) continue;
+        if (n.troops < I.troops * 1.15) continue;
         const last = brain.allianceAsked.get(n.p.id());
         if (last !== undefined && I.tick - last < 90 * TICKS_PER_SEC) continue;
         brain.allianceAsked.set(n.p.id(), I.tick);
@@ -681,17 +722,30 @@
   }
 
   // ----- attacking -----------------------------------------------------------
-  function scoreTarget(I, n, sendable) {
+  /** How much stronger than a player we must be before attacking them. */
+  function strengthNeeded(policy, n) {
+    let req = 1.7 - policy.aggr * 0.06; // 1.64 (turtle) .. 1.1 (berserk)
+    if (n.busy > n.troops * 0.5) req *= 0.8; // they are busy fighting someone else
+    if (n.traitor) req *= 0.9;
+    return req;
+  }
+
+  /** Score a player neighbour; -1 when attacking them is too risky. */
+  function scoreTarget(I, n, sendable, policy, strat) {
     if (n.friendly) return -1;
     if (I.immunity && n.type !== PT.Bot) return -1;
     if (I.nationImmunity && n.type === PT.Nation) return -1;
     if (n.type === PT.Human && !S.attackHumans) return -1;
-    const hittingUs = I.attackers.get(n.sid) || 0;
-    // Do not poke a much bigger army that is not already busy with us.
-    if (n.troops > I.troops * 1.15 && hittingUs === 0 && n.busy < n.troops * 0.5) return -1;
+    if (n.type !== PT.Bot) {
+      // Only fight players we clearly outclass.
+      if (I.troops < n.troops * strengthNeeded(policy, n)) return -1;
+      // A strong player is next door: only pick on tiny ones.
+      if (strat.careful && !strat.dangerous.includes(n) && n.troops > I.troops * 0.35) return -1;
+      if (strat.dangerous.includes(n)) return -1;
+    }
     const density = n.troops / Math.max(1, n.land);
     let score = sendable / Math.max(1, n.troops); // raw odds
-    if (n.type === PT.Bot) score *= 1.8; // tribes are weak and give free land
+    if (n.type === PT.Bot) score *= 2.5; // bots first, always
     if (n.type === PT.Human) score *= 0.9;
     score *= 1 + Math.min(1, n.contacts / 150) * 0.5; // long fronts are efficient
     score /= 1 + density / 50; // thinly held land falls fast
@@ -699,19 +753,49 @@
     if (n.busy > 0) score *= 1 + Math.min(0.6, n.busy / Math.max(1, n.troops)); // fighting someone else
     if (n.land < I.land * 0.08) score *= 1.4; // finish off the nearly dead
     score /= 1 + n.posts * 0.08; // fortified players cost more
+    const hittingUs = I.attackers.get(n.sid) || 0;
     if (hittingUs > 0 && n.troops < I.troops) score *= 1.6; // revenge while they are committed
     if (n.trend > 0.35 && n.troops < I.troops) score *= 1.2; // strike before they finish massing
-    // Stick to one war at a time when possible.
-    const at = I.outgoing.filter((a) => a.targetID !== 0);
-    if (at.some((a) => a.targetID === n.sid)) score *= 0.6;
-    else if (at.length > 0) score *= 0.7;
+    // Stick to one war at a time.
+    const wars = I.outgoing.filter((a) => a.targetID !== 0 && !isBotID(I, a.targetID));
+    if (wars.some((a) => a.targetID === n.sid)) score *= 0.6;
+    else if (wars.length > 0) score *= 0.5;
     return score;
   }
 
-  function doAttack(g, me, I, policy) {
+  function isBotID(I, sid) {
+    const n = I.neighbors.find((x) => x.sid === sid);
+    return !!n && n.type === PT.Bot;
+  }
+
+  /** Priority 1: hit every bot next to us, hard, in parallel. */
+  function doBotHunt(g, me, I, policy, strat) {
+    if (!S.attackPlayers || strat.bots.length === 0) return false;
+    if (!brain.cd.ready("bot", 1500)) return false;
+    const botAttacks = I.outgoing.filter((a) => isBotID(I, a.targetID)).length;
+    const maxBotAttacks = 2 + Math.ceil(policy.aggr / 4); // 3..5
+    if (botAttacks >= maxBotAttacks) return false;
+    let free = Math.floor(policy.safeSendable);
+    // Weakest first: they fall fastest and free troops for the next one.
+    const bots = strat.bots
+      .filter((n) => !I.outgoing.some((a) => a.targetID === n.sid))
+      .sort((a, b) => a.troops - b.troops);
+    for (const n of bots) {
+      // Overwhelm them so the attack does not stall.
+      const amount = Math.floor(Math.min(free, Math.max(n.troops * 3, I.maxTroops * 0.05)));
+      if (amount < n.troops * 1.5 || amount < I.maxTroops * 0.03) continue;
+      if (emit("attack", { targetID: n.p.id(), troops: amount })) {
+        brain.cd.mark("bot");
+        brain.target = n.p.displayName() + " (bot)";
+        log(`Hunting bot ${n.p.displayName()} (${fmtTroops(n.troops)}) with ${fmtTroops(amount)}`);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function doAttack(g, me, I, policy, strat) {
     const aggr = policy.aggr;
-    const maxConcurrent = 1 + Math.ceil(aggr / 4); // 2..4
-    if (I.outgoing.length >= maxConcurrent) return false;
 
     // Counter-attack: someone sent their army at us and left home empty.
     if (S.defend && S.attackPlayers && I.attackers.size > 0 && brain.cd.ready("counter", 6000)) {
@@ -732,19 +816,23 @@
       }
     }
 
+    // 1) Bots first, always.
+    if (doBotHunt(g, me, I, policy, strat)) return true;
+
+    const nonBotAttacks = I.outgoing.filter((a) => !isBotID(I, a.targetID)).length;
+    const maxConcurrent = 1 + Math.ceil(aggr / 5); // 2..3
+    if (nonBotAttacks >= maxConcurrent) return false;
+
     // Near the cap troops stop growing, so anything above it is wasted.
     const overflow = I.ratio >= 0.9;
-    if (I.ratio < policy.trigger && !overflow) return false;
     if (!brain.cd.ready("attack", 2500 + (10 - aggr) * 350)) return false;
 
-    const send = Math.floor(policy.sendable);
-    if (send < I.maxTroops * 0.05) return false;
-
-    // 1) Unclaimed land is the cheapest growth there is.
-    if (S.expand && I.unclaimedContacts > 0) {
+    // 2) Unclaimed land: no one fights back, only the home guard is kept.
+    if (S.expand && I.unclaimedContacts > 0 && (I.ratio >= policy.trigger * 0.85 || overflow)) {
       const alreadyExpanding = I.outgoing.some((a) => a.targetID === 0);
-      if (!alreadyExpanding || I.ratio > policy.trigger + 0.15) {
-        const amount = Math.floor(send * (I.neighbors.length > 0 ? 0.6 : 0.85));
+      const send = Math.floor(policy.safeSendable);
+      if ((!alreadyExpanding || I.ratio > policy.trigger + 0.15) && send >= I.maxTroops * 0.05) {
+        const amount = Math.floor(send * (strat.bots.length > 0 ? 0.5 : I.neighbors.length > 0 ? 0.6 : 0.85));
         if (emit("attack", { targetID: null, troops: amount })) {
           brain.cd.mark("attack");
           brain.target = "free land";
@@ -754,27 +842,34 @@
       }
     }
 
-    // 2) Pick the best neighbour to hit.
+    // 3) Players: only when clearly stronger, never all-in.
     if (!S.attackPlayers) return false;
+    if (I.ratio < policy.trigger && !overflow) return false;
+    const send = Math.floor(policy.sendable);
+    if (send < I.maxTroops * 0.05) return false;
     let best = null,
       bestScore = 0;
     for (const n of I.neighbors) {
-      const s = scoreTarget(I, n, send);
-      if (s > bestScore) {
-        bestScore = s;
+      if (n.type === PT.Bot) continue;
+      const sc = scoreTarget(I, n, send, policy, strat);
+      if (sc > bestScore) {
+        bestScore = sc;
         best = n;
       }
     }
-    const minScore = overflow ? 0.35 : 1.1 - aggr * 0.06; // 1.04 .. 0.5
+    const minScore = overflow ? 0.6 : 1.2 - aggr * 0.05; // 1.15 .. 0.7
     if (!best || bestScore < minScore) return false;
-    // Send enough to break through decisively, but keep the rest growing.
-    const needed = best.troops * (1.4 + Math.min(1, best.posts * 0.1));
-    const amount = Math.floor(Math.min(send, Math.max(send * 0.5, needed)));
+    // Keep enough at home that the target cannot simply counter-attack.
+    const keepHome = Math.max(best.troops * 0.7, policy.homeGuard);
+    const amount = Math.floor(
+      Math.min(send, I.troops - keepHome, best.troops * (1.6 + Math.min(1, best.posts * 0.1))),
+    );
+    if (amount < best.troops * 1.2 || amount < I.maxTroops * 0.05) return false;
     if (emit("attack", { targetID: best.p.id(), troops: amount })) {
       brain.cd.mark("attack");
       brain.target = best.p.displayName();
       log(
-        `Attacking ${best.p.displayName()} (${fmtTroops(best.troops)} troops, score ${bestScore.toFixed(2)}) with ${fmtTroops(amount)}`,
+        `Attacking ${best.p.displayName()} (${fmtTroops(best.troops)} troops vs our ${fmtTroops(I.troops)}) with ${fmtTroops(amount)}`,
       );
       return true;
     }
@@ -782,12 +877,12 @@
   }
 
   // ----- naval invasions -----------------------------------------------------
-  async function doBoat(g, me, I, policy) {
+  async function doBoat(g, me, I, policy, strat) {
     if (!S.boats || I.shore.length === 0) return false;
     if (I.ratio < policy.trigger && I.ratio < 0.9) return false;
     // Only when land targets are exhausted.
-    if (I.unclaimedContacts > 0) return false;
-    if (I.neighbors.some((n) => scoreTarget(I, n, policy.sendable) > 0.8)) return false;
+    if (I.unclaimedContacts > 0 || strat.bots.length > 0) return false;
+    if (I.neighbors.some((n) => scoreTarget(I, n, policy.sendable, policy, strat) > 0.8)) return false;
     if (I.mine[UT.Transport].length >= (policy.aggr >= 7 ? 2 : 1)) return false;
     if (!brain.cd.ready("boat", 15000)) return false;
     brain.cd.mark("boat");
@@ -810,9 +905,13 @@
         if (!p || !p.isPlayer() || safe(() => me.isFriendly(p), true)) continue;
         if (p.type() === PT.Human && !S.attackHumans) continue;
         if (I.immunity) continue;
-        const odds = amount / Math.max(1, num(p.troops()));
-        if (odds < 0.8) continue;
-        weakness = Math.min(3, odds) * (p.type() === PT.Bot ? 1.3 : 1);
+        const theirs = num(p.troops());
+        const isBot = p.type() === PT.Bot;
+        // Bots across the sea are fair game; players only if we clearly outclass them.
+        if (!isBot && I.troops < theirs * strengthNeeded(policy, { busy: 0, troops: theirs })) continue;
+        const odds = amount / Math.max(1, theirs);
+        if (odds < (isBot ? 1.2 : 1.5)) continue;
+        weakness = Math.min(3, odds) * (isBot ? 2.5 : 1);
       }
       const d = Math.hypot(x - I.cx, y - I.cy);
       cands.push({ t, score: weakness * 100 - d * 0.6 });
@@ -872,8 +971,12 @@
       wants.push({ type: UT.Factory, why: "train income" });
     }
     // Fortify the border with a neighbour that is massing an army.
-    if (S.defend && C >= 2 && strat.massing && D < 4) {
-      wants.push({ type: UT.DefensePost, why: "neighbour massing troops", proactive: true });
+    if (S.defend && C >= 1 && (strat.massing || strat.careful) && D < 2 + strat.dangerous.length) {
+      wants.push({
+        type: UT.DefensePost,
+        why: strat.careful ? "strong player next door" : "neighbour massing troops",
+        proactive: true,
+      });
     }
     if (S.nukes && C >= 3 && M < (I.landShare > 0.2 ? 2 : 1)) {
       wants.push({ type: UT.MissileSilo, why: "nuclear option" });
@@ -902,8 +1005,9 @@
           if (n) enemyFront.push(...n.tiles);
         }
       } else {
+        // Fortify the border with the strongest player next door.
         const m = I.neighbors
-          .filter((n) => !n.friendly && n.trend > 0.35)
+          .filter((n) => !n.friendly && n.type !== PT.Bot)
           .sort((a, b) => b.troops - a.troops)[0];
         if (m) enemyFront.push(...m.tiles);
       }
@@ -1280,8 +1384,8 @@
       brain.plan = "Growing troops";
       doDiplomacy(g, me, I, strat);
       if (!doRetreat(I, strat)) {
-        const attacked = doAttack(g, me, I, policy);
-        if (!attacked) await doBoat(g, me, I, policy);
+        const attacked = doAttack(g, me, I, policy, strat);
+        if (!attacked) await doBoat(g, me, I, policy, strat);
       }
       await doNukes(g, me, I, strat);
       await doBuild(g, me, I, policy, strat);
@@ -1503,6 +1607,8 @@
 
   function relationLabel(I, n) {
     if (n.friendly) return '<span class="good">ally</span>';
+    if (n.type === PT.Bot) return '<span class="good">bot – target</span>';
+    if (I.strat && I.strat.dangerous.includes(n)) return '<span class="bad">⚠ danger – careful</span>';
     const hitting = I.attackers.get(n.sid) || 0;
     if (hitting > 0) return `<span class="bad">attacking you (${fmtTroops(hitting)})</span>`;
     const r = n.troops / Math.max(1, I.troops);
@@ -1559,6 +1665,7 @@
         <div class="row"><span>Troops</span><span>${fmtTroops(I.troops)} / ${fmtTroops(I.maxTroops)} (${pct(I.ratio)})</span></div>
         ${bar(I.ratio, p.reserve, p.trigger)}
         <div class="row muted"><span>reserve ${pct(p.reserve || 0)}</span><span>attacks at ${pct(p.trigger || 0)}</span></div>
+        <div class="row"><span>Home guard</span><span>${fmtTroops(p.homeGuard || 0)} kept for defence</span></div>
         <div class="row"><span>Attacks out</span><span>${I.outgoing.length} (${fmtTroops(I.outgoingTroops)})</span></div>
         ${threat}
         ${I.nukesAtUs > 0 ? `<div class="bad">☢ ${I.nukesAtUs} nuke(s) flying at you!</div>` : ""}
