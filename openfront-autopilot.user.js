@@ -115,6 +115,9 @@
   // Small helpers
   // ---------------------------------------------------------------------------
   const now = () => performance.now();
+  // Game clock in ms (10 ticks per second). All in-game timing uses it, so the
+  // bot behaves the same at any game speed and pauses with the game.
+  const gameNow = () => (hook && hook.game ? safe(() => hook.game.ticks(), 0) * 100 : now());
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   const num = (v) => (typeof v === "bigint" ? Number(v) : Number(v ?? 0));
   function fmt(n) {
@@ -150,10 +153,10 @@
     }
     ready(key, ms) {
       const last = this.t.get(key);
-      return last === undefined || now() - last >= ms;
+      return last === undefined || gameNow() - last >= ms;
     }
     mark(key) {
-      this.t.set(key, now());
+      this.t.set(key, gameNow());
     }
     reset() {
       this.t.clear();
@@ -291,6 +294,7 @@
       this.spawn = null;
       this.spawnMoves = 0;
       this.nukeHit = null;
+      this.lastTick = undefined;
     },
   };
 
@@ -834,7 +838,7 @@
     if (I.immunity && n.type !== PT.Bot) return -1;
     if (I.nationImmunity && n.type === PT.Nation) return -1;
     if (n.type === PT.Human && !S.attackHumans) return -1;
-    const nuked = brain.nukeHit && brain.nukeHit.sid === n.sid && now() < brain.nukeHit.until;
+    const nuked = brain.nukeHit && brain.nukeHit.sid === n.sid && gameNow() < brain.nukeHit.until;
     if (n.type !== PT.Bot && nuked) {
       // We just nuked them: strike while their troops are down.
       if (I.troops < n.troops) return -1;
@@ -1374,7 +1378,7 @@
       if (emit("build", { unit: type, tile: best, rocketDirectionUp: true })) {
         brain.cd.mark("nuke");
         // Follow up on land while their troops are down.
-        brain.nukeHit = { sid: target.smallID(), until: now() + 40000 };
+        brain.nukeHit = { sid: target.smallID(), until: gameNow() + 40000 };
         log(`☢ Launched ${type} at ${target.displayName()} (value ${bestVal})`);
         return;
       }
@@ -1568,10 +1572,16 @@
       soloTick();
       const g = hook.game;
       if (!g) return;
-      if (safe(() => g.isSpectator(), false)) {
+      // Note: the game's isSpectator() is also true before we have spawned, so
+      // it must not be used here or the bot would never place its spawn.
+      if (safe(() => g.config().isReplay(), false) || (!g.myPlayer() && !g.inSpawnPhase())) {
         brain.plan = "Spectating";
         return;
       }
+      // Decide once per game second, whatever the game speed.
+      const tick = safe(() => g.ticks(), 0);
+      if (brain.lastTick !== undefined && tick - brain.lastTick < 10 && tick >= brain.lastTick) return;
+      brain.lastTick = tick;
       if (g.inSpawnPhase()) {
         if (S.enabled && hook.ctors.spawn) doSpawn(g);
         brain.intel = null;
@@ -1916,7 +1926,7 @@
     if (!document.body) return setTimeout(boot, 200);
     buildPanel();
     render();
-    setInterval(think, 1000);
+    setInterval(think, 200);
     setInterval(render, 500);
     log(
       S.enabled && S.soloLoop
