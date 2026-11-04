@@ -31,8 +31,8 @@ jobs:
         # GitHub's Ubuntu runners ship the Android SDK (ANDROID_HOME is set).
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon --stacktrace assembleDebug
-          cp app/build/outputs/apk/debug/app-debug.apk ../OpenFrontAutopilot.apk
+          ./gradlew --no-daemon --stacktrace assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk ../OpenFrontAutopilot.apk
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
