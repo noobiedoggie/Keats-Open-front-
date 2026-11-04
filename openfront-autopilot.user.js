@@ -1504,12 +1504,16 @@
     // Only nuke someone we are actually fighting (or, in the endgame, any
     // rival). Nuking a giant we just asked for peace would only provoke it.
     const neighborIDs = new Set(I.neighbors.map((n) => n.sid));
+    // On Hard/Impossible the nations answer nukes with nukes and MIRVs: only
+    // nuke someone who is attacking us right now.
+    const strictNukes = ["Hard", "Impossible"].includes(safe(() => g.config().gameConfig().difficulty, ""));
     const atWarWith = (p) =>
       I.attackers.has(p.smallID()) ||
-      I.outgoing.some((a) => a.targetID === p.smallID()) ||
-      strat.stance === "Endgame" ||
-      strat.dangerous.some((n) => n.sid === p.smallID()) || // the strong neighbour: nuke it down to size
-      (neighborIDs.has(p.smallID()) && num(p.troops()) < I.troops * 1.3);
+      (!strictNukes &&
+        (I.outgoing.some((a) => a.targetID === p.smallID()) ||
+          strat.stance === "Endgame" ||
+          strat.dangerous.some((n) => n.sid === p.smallID()) ||
+          (neighborIDs.has(p.smallID()) && num(p.troops()) < I.troops * 1.3)));
     const hostile = g
       .players()
       .filter(
@@ -1623,7 +1627,7 @@
     if (s2 && s2.share < 0.01) tips.push("Slow opening: under 1% of the map after 2 minutes");
     const s5 = at(300);
     if (s5 && s5.cities < 3) tips.push(`Only ${s5.cities} cities after 5 minutes`);
-    if (L.gold > 1_500_000) tips.push(`Died with ${fmt(L.gold)} gold unspent`);
+    if (dead && L.gold > 1_500_000) tips.push(`Died with ${fmt(L.gold)} gold unspent`);
     const worst = Object.entries(r.attackers).sort((a, b) => b[1].max - a[1].max)[0];
     if (dead && worst) {
       const [name, a] = worst;
