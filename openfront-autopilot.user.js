@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront Autopilot
 // @namespace    https://github.com/noobiedoggie/keats-open-front-
-// @version      3.0.0
+// @version      3.1.0
 // @description  Fully hands-off autopilot + intel HUD for OpenFront.io: starts solo games, spawns, expands, wages war, builds, defends, nukes and requeues by itself.
 // @author       Keats
 // @match        https://openfront.io/*
@@ -834,7 +834,7 @@
     if (emit("spawn", { tile: pick.tile })) {
       pick.at = gameNow();
       brain.spawn = pick;
-      brain.plan = `Spawned – spot score ${Math.round(pick.score)}`;
+      brain.plan = `Spawn sent at (${g.x(pick.tile)}, ${g.y(pick.tile)}) – spot score ${Math.round(pick.score)}`;
       log(`Spawning at (${g.x(pick.tile)}, ${g.y(pick.tile)}), spot score ${Math.round(pick.score)}`);
     }
   }
@@ -1884,7 +1884,11 @@
       if (brain.lastTick !== undefined && tick - brain.lastTick < 10 && tick >= brain.lastTick) return;
       brain.lastTick = tick;
       if (g.inSpawnPhase()) {
-        if (S.enabled && hook.ctors.spawn) doSpawn(g);
+        // Auto spawn works on its own, even with the autopilot off, so the
+        // spawn is never missed by pressing START too late.
+        if (!S.autoSpawn) brain.plan = "Spawn phase – auto spawn is off (tick it in Brain)";
+        else if (!hook.ctors.spawn) brain.plan = "Spawn phase – spawn control not found yet…";
+        else doSpawn(g);
         brain.intel = null;
         return;
       }
