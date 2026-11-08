@@ -608,6 +608,25 @@
       myCityLevels,
       cityLevelCap,
       mirvLine,
+      ...(() => {
+        // The game's nations gang up on a "runaway leader" whose land reaches
+        // a multiple of the runner-up's (Medium 3x, Hard 2x, Impossible 1.5x),
+        // and MIRV a leader past a share of the map (victory denial:
+        // Easy 75%, Medium 65%, Hard 55%, Impossible 40%).
+        const runaway = { Easy: null, Medium: 3, Hard: 2, Impossible: 1.5 }[difficulty] ?? 3;
+        const denial = { Easy: 0.75, Medium: 0.65, Hard: 0.55, Impossible: 0.4 }[difficulty] ?? 0.65;
+        let runnerUpTiles = 0;
+        for (const p of g.players()) {
+          if (p === me || !p.isAlive() || p.type() === PT.Bot) continue;
+          runnerUpTiles = Math.max(runnerUpTiles, p.numTilesOwned());
+        }
+        const myTiles = me.numTilesOwned();
+        return {
+          runawayFactor: runaway,
+          runawayRatio: runnerUpTiles > 0 ? myTiles / runnerUpTiles : Infinity,
+          denialShare: nationsAlive > 0 ? denial : 1,
+        };
+      })(),
       mirvThreats,
       immunity: safe(() => g.isSpawnImmunityActive(), false),
       nationImmunity: safe(() => g.isNationSpawnImmunityActive(), false),
@@ -671,9 +690,32 @@
     if (S.adaptive && biggestPlayer > 0 && I.troops > biggestPlayer * 2) aggr += 1;
     // Nations target the land / city leader with MIRVs and invasions.
     const leader = I.rank === 1 && I.playerCount > 2;
+    // About to be (or already) a runaway leader: every bordering nation will
+    // attack at once. Prepare before crossing the line, hold firm after.
+    const crowned = I.runawayFactor !== null && I.runawayRatio >= I.runawayFactor * 0.9 && I.playerCount > 2;
+    // When crowned, every bordering nation attacks at once: what matters is
+    // their combined army, not the biggest one.
+    const borderNationTroops = I.neighbors
+      .filter((n) => !n.friendly && n.type !== PT.Bot)
+      .reduce((sum, n) => sum + n.troops, 0);
+    // Not strong enough to take the gang-up yet: stop taking land, grow
+    // the economy and the army first.
+    const crownHold = crowned && I.troops < borderNationTroops * 0.9;
+    // Near the victory-denial share with MIRV-capable nations around:
+    // disarm (and loot) them before taking more land.
+    const decapitate =
+      I.landShare >= I.denialShare - 0.08 &&
+      I.mirvThreats.some((p) => I.neighbors.some((n) => n.p === p && !n.friendly));
+    if (decapitate && stance !== "Defense") stance = "Decapitation";
+    else if (crownHold && stance !== "Defense") stance = "Crowned (holding)";
+    else if (crowned && (stance === "Endgame" || stance === "Build-up" || stance === "War")) stance = "Crowned";
     return {
       stance,
       leader,
+      crowned,
+      crownHold,
+      borderNationTroops,
+      decapitate,
       aggr: clamp(aggr, 1, 10),
       threat,
       massing,
@@ -703,6 +745,12 @@
     // The leader is who the game's nations MIRV, then invade. Being caught
     // with an empty army is how a dominant game was lost: keep 40%+ home.
     if (strat.leader && I.enemySilos > 0) reserve = Math.max(reserve, 0.4);
+    // Crowned: the whole neighbourhood is about to attack - their stacks only
+    // come if they can win, so a full home army keeps most of them away.
+    if (strat.crowned) {
+      reserve = Math.max(reserve, 0.5);
+      trigger = Math.max(trigger, reserve + 0.15);
+    }
     // Early land grab: unclaimed land is cheap, expand faster.
     if (I.unclaimedContacts > 0 && I.neighbors.length === 0) {
       reserve -= 0.08;
@@ -716,7 +764,8 @@
     const homeFactor = 0.85 - aggr * 0.03; // 0.82 .. 0.55
     // Capped at 60% of our army: against a giant, hoarding everything would not
     // save us anyway, while eating bots makes us bigger.
-    const homeGuard = Math.min(strat.biggestPlayer * homeFactor, I.troops * 0.6) + I.incomingTroops;
+    let homeGuard = Math.min(strat.biggestPlayer * homeFactor, I.troops * 0.6) + I.incomingTroops;
+    if (strat.crowned) homeGuard = Math.max(homeGuard, Math.min(strat.borderNationTroops * 0.5, I.troops * 0.8));
     // Troops free for player wars: above both the growth reserve and the guard.
     const sendable = Math.max(0, I.troops - Math.max(reserve * I.maxTroops, homeGuard));
     // Troops free for bots / free land. The game's own nations keep only
@@ -1061,6 +1110,11 @@
     if (nuked && I.troops < n.troops * 2) score *= 0.3; // fallout, unless we vastly outnumber them
     if (hittingUs > 0 && n.troops < I.troops) score *= 1.6; // revenge while they are committed
     if (n.trend > 0.35 && n.troops < I.troops) score *= 1.2; // strike before they finish massing
+    // Loot: taking a nation hands over all its gold. Disarm: a nation with a
+    // silo and MIRV money is the one that would MIRV us - take it first.
+    const theirGold = num(safe(() => n.p.gold(), 0));
+    if (n.type === PT.Nation) score *= 1 + Math.min(1, theirGold / 10_000_000);
+    if (I.mirvThreats.includes(n.p)) score *= strat.decapitate ? 3 : 1.6;
     // Stick to one war at a time.
     const wars = I.outgoing.filter((a) => a.targetID !== 0 && !isBotID(I, a.targetID));
     if (wars.some((a) => a.targetID === n.sid)) score *= 0.6;
@@ -1087,6 +1141,7 @@
     brain.farms = [];
     const bots = strat.bots
       .filter((n) => !I.outgoing.some((a) => a.targetID === n.sid))
+      .filter((n) => brain.cd.ready("hunt:" + n.sid, 8000)) // not the same bot every second
       .filter((n) => {
         if (n.encircling) {
           brain.farms.push({ name: n.p.displayName(), gold: n.gold, target: HARVEST_AT, encircling: true });
@@ -1119,6 +1174,7 @@
       if (amount < n.troops * 1.5 || amount < I.maxTroops * 0.03) continue;
       if (emit("attack", { targetID: n.p.id(), troops: amount })) {
         brain.cd.mark("bot");
+        brain.cd.mark("hunt:" + n.sid);
         brain.target = n.p.displayName() + " (bot)";
         log(`Hunting bot ${n.p.displayName()} (${fmtTroops(n.troops)}) with ${fmtTroops(amount)}`);
         return true;
@@ -1155,6 +1211,9 @@
         // 15%+ of our land, or when defending would cost us more than 60%.
         const worthBlocking = tilesLost > I.land * 0.15 || ourLossIfDefended > incomingTroops * 0.6;
         if (!worthBlocking) continue; // let it break on our land
+        // A huge attack (half our army or more): blocking it 1:1 would leave
+        // us empty for the next wave. Defenders on our land do far better.
+        if (incomingTroops > I.troops * 0.5) continue;
         if (available < incomingTroops) continue; // a partial block just throws troops away
         let amount = Math.min(available, incomingTroops * 1.05);
         // Their army is out of the house: hit back for real, but never empty
@@ -1200,7 +1259,7 @@
     // 2) Unclaimed land, like the game's nations do it: half the army goes out
     // the moment the game starts, then everything above the expansion floor
     // every few seconds (attacks on the same target merge in the game).
-    if (S.expand && I.unclaimedContacts > 0 && brain.cd.ready("expand", 1500 + (10 - aggr) * 150)) {
+    if (S.expand && I.unclaimedContacts > 0 && !strat.decapitate && !strat.crownHold && brain.cd.ready("expand", 1500 + (10 - aggr) * 150)) {
       const opening = !brain.openingSent;
       // Free land costs only ~16-25 troops per tile, so a modest stack is
       // enough; topping up a huge one just parks troops that stop regrowing.
@@ -1225,6 +1284,7 @@
 
     // 3) Players: only when clearly stronger, never all-in.
     if (!S.attackPlayers) return false;
+    if (strat.crownHold) return false; // holding the crown: build up first
     // What we can afford to send at target n: keep enough home for n itself
     // (60% of its army, defenders fight with an advantage), for every other
     // player next door, and the leader's anti-MIRV reserve. This is sized to
@@ -1248,6 +1308,7 @@
     // well defended for this turn, which used to freeze the bot at its cap.
     const ranked = I.neighbors
       .filter((n) => n.type !== PT.Bot)
+      .filter((n) => !strat.decapitate || I.mirvThreats.includes(n.p))
       .map((n) => ({ n, sc: scoreTarget(I, n, affordable(n), policy, strat) }))
       .filter((x) => x.sc > 0)
       .sort((a, b) => b.sc - a.sc);
@@ -1285,7 +1346,7 @@
     if (I.boxed && S.attackPlayers && I.ratio > 0.75 && brain.cd.ready("breakout", 15000)) {
       const options = I.neighbors
         .filter((n) => isPlayerNeighbor(n) && !(n.type === PT.Human && !S.attackHumans))
-        .filter((n) => I.troops >= n.troops * 0.9)
+        .filter((n) => I.troops >= n.troops * (["Hard", "Impossible"].includes(safe(() => g.config().gameConfig().difficulty, "")) ? 1.1 : 0.9))
         .map((n) => ({
           n,
           ease: (I.troops / Math.max(1, n.troops)) * (n.busy > 0 ? 1.5 : 1) * (n.traitor ? 1.3 : 1) * (1 + Math.min(1, n.contacts / 150)),
@@ -1307,7 +1368,14 @@
 
     // Last resort at the troop cap: nothing else to do, so push through
     // nuked land (2.5-5x dearer, but capped troops are wasted anyway).
-    if (overflow && I.unclaimedContacts === 0 && I.falloutContacts > 0 && !I.outgoing.some((a) => a.targetID === 0)) {
+    if (
+      overflow &&
+      I.secondsIn > 900 &&
+      I.unclaimedContacts === 0 &&
+      I.falloutContacts > 0 &&
+      !strat.careful &&
+      !I.outgoing.some((a) => a.targetID === 0)
+    ) {
       const amount = Math.floor(I.maxTroops * 0.25);
       if (emit("attack", { targetID: null, troops: amount })) {
         brain.cd.mark("attack");
@@ -1341,6 +1409,7 @@
   // ----- naval invasions -----------------------------------------------------
   async function doBoat(g, me, I, policy, strat) {
     if (!S.boats || I.shore.length === 0) return false;
+    if (strat.crownHold) return false;
     if (I.ratio < policy.trigger && I.ratio < 0.9 && !(I.boxed && I.ratio > 0.6)) return false;
     // Only when land targets are exhausted.
     if (I.unclaimedContacts > 0 || strat.huntBots.length > 0) return false;
@@ -1452,16 +1521,16 @@
     if (S.defend && I.nukesAtUs > 0 && SAM < C + 1) {
       wants.push({ type: UT.SAMLauncher, why: "nukes incoming" });
     }
-    const samTarget = strat.leader ? Math.ceil(C * 0.5) : Math.ceil(C * 0.35);
+    const samTarget = strat.crowned || strat.decapitate ? Math.ceil(C * 0.7) : strat.leader ? Math.ceil(C * 0.5) : Math.ceil(C * 0.35);
     if (S.defend && I.enemySilos > 0 && SAM < Math.max(1, samTarget)) {
       wants.push({ type: UT.SAMLauncher, why: strat.leader ? "leader: MIRV shield" : "enemies have nukes" });
     }
     if (C === 0) wants.push({ type: UT.City, why: "first city" });
     // A strong player next door: fortify that border right after the first city.
-    if (S.defend && C >= 1 && (strat.massing || strat.careful) && D < Math.min(5, 2 + strat.dangerous.length)) {
+    if (S.defend && C >= 1 && (strat.massing || strat.careful || strat.crowned) && D < Math.min(strat.crowned ? 10 : 5, 2 + strat.dangerous.length + (strat.crowned ? 4 : 0))) {
       wants.push({
         type: UT.DefensePost,
-        why: strat.careful ? "strong player next door" : "neighbour massing troops",
+        why: strat.crowned ? "runaway leader: fortify before the gang-up" : strat.careful ? "strong player next door" : "neighbour massing troops",
         proactive: true,
       });
     }
@@ -1714,6 +1783,14 @@
     const over = I.myCityLevels - I.mirvLine + 1;
     const cities = I.mine[UT.City].filter((u) => u.id && !u.isUnderConstruction());
     if (cities.length === 0) return false;
+    // Hopeless (e.g. after capturing a nation's cities): trimming would only
+    // throw troop capacity away. Allow it when 2 deletions can get us under.
+    const top2 = cities
+      .map((u) => u.level())
+      .sort((a, b) => b - a)
+      .slice(0, 2)
+      .reduce((s2, l) => s2 + l, 0);
+    if (over > top2) return false;
     // Smallest city that covers the overshoot on its own, else the biggest.
     cities.sort((a, b) => a.level() - b.level());
     const pick = cities.find((u) => u.level() >= over) || cities[cities.length - 1];
