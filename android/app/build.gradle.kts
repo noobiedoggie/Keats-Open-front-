@@ -19,8 +19,8 @@ android {
         applicationId = "io.keats.openfrontautopilot"
         minSdk = 26
         targetSdk = 35
-        versionCode = 9
-        versionName = "3.2.1"
+        versionCode = 10
+        versionName = "3.3.0"
     }
 
     // A fixed key, so every new build installs over the previous one.

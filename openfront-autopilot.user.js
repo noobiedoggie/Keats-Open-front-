@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront Autopilot
 // @namespace    https://github.com/noobiedoggie/keats-open-front-
-// @version      3.2.1
+// @version      3.3.0
 // @description  Fully hands-off autopilot + intel HUD for OpenFront.io: starts solo games, spawns, expands, wages war, builds, defends, nukes and requeues by itself.
 // @author       Keats
 // @match        https://openfront.io/*
@@ -304,6 +304,8 @@
       this.randomSpawnLogged = false;
       this.nukeHit = null;
       this.lastTick = undefined;
+      this.bestLand = undefined;
+      this.lastProgress = 0;
     },
   };
 
@@ -646,6 +648,8 @@
     if (threat > 0.35) {
       stance = "Defense";
       if (S.adaptive) aggr -= 2;
+    } else if (I.boxed) {
+      stance = "Breakout"; // walled in by other countries: break out
     } else if (careful) {
       stance = "Careful";
       if (S.adaptive) aggr -= 2;
@@ -739,12 +743,28 @@
       .map((n) => ({ x: n.coordinates[0], y: n.coordinates[1] }));
   }
 
-  /** Score a spawn tile: free land we can actually reach, bots to eat, players to avoid. */
-  function scoreSpawn(g, start, mySid, ownerType, planned = []) {
-    const R = 45; // look this far around
+  /**
+   * Score a spawn tile by the territory that will be ours: land reachable on
+   * foot that is closer to this spot than to any rival (nations, planned or
+   * already placed, and other players). That is the room we get before we
+   * touch anyone - the real measure of a good spawn. Bots inside count as a
+   * bonus (easy land + all their gold), ocean coast a little (ports, boats).
+   */
+  function scoreSpawn(g, start, mySid, ownerType, planned = [], rivals = []) {
+    const R = 120;
     const R2 = R * R;
     const sx = g.x(start),
       sy = g.y(start);
+    // Rival seeds that could compete for this area.
+    const seeds = planned
+      .concat(rivals)
+      .filter((p) => Math.hypot(p.x - sx, p.y - sy) < R * 2 + 60)
+      .map((p) => [p.x, p.y]);
+    const closerToRival = (x, y) => {
+      const d0 = (x - sx) * (x - sx) + (y - sy) * (y - sy);
+      for (const [px, py] of seeds) if ((x - px) * (x - px) + (y - py) * (y - py) < d0) return true;
+      return false;
+    };
     const seen = new Set([start]);
     const queue = [start];
     let land = 0,
@@ -752,44 +772,59 @@
       coast = 0,
       enemyNear = 0,
       nodes = 0;
-    // Flood fill over land only: land across the sea does not count.
-    while (queue.length && nodes < 7000) {
-      const t = queue.pop();
+    let qi = 0; // index-based queue: shift() would be quadratic
+    while (qi < queue.length && nodes < 14000) {
+      const t = queue[qi++];
       nodes++;
       const o = g.ownerID(t);
       if (o === 0 || o === mySid) {
         land += TERRAIN_VALUE[safe(() => g.terrainType(t), 0)] ?? 0.5;
       } else if (ownerType(o) === PT.Bot) {
-        bots += 0.8; // easy land, and all their gold when they die
+        bots += 0.8;
       } else {
         const d = Math.hypot(g.x(t) - sx, g.y(t) - sy);
-        enemyNear += 30 / Math.max(5, d); // the closer a real player, the worse
+        enemyNear += 30 / Math.max(5, d);
         continue; // do not walk through other players
       }
+      if (safe(() => g.isOceanShore(t), false)) coast++;
       for (const n of g.neighbors(t)) {
         if (seen.has(n)) continue;
         seen.add(n);
-        const dx = g.x(n) - sx,
-          dy = g.y(n) - sy;
-        if (dx * dx + dy * dy > R2) continue;
-        if (!g.isLand(n)) {
-          coast++;
-          continue;
-        }
-        if (safe(() => g.isImpassable(n), false)) continue;
+        const nx = g.x(n),
+          ny = g.y(n);
+        if ((nx - sx) * (nx - sx) + (ny - sy) * (ny - sy) > R2) continue;
+        if (!g.isLand(n) || safe(() => g.isImpassable(n), false)) continue;
+        if (closerToRival(nx, ny)) continue; // their side of the border
         queue.push(n);
       }
     }
-    // Some coast is good (ports, trade); a tiny island is not.
-    const coastBonus = Math.min(coast, 120) * 0.5;
-    // Nations that have not spawned yet: the closer their planned spot, the
-    // worse (they expand fast and attack early).
+    const coastBonus = Math.min(coast, 150) * 0.5;
+    // Right next to a nation's planned spot is still bad: it attacks early.
     let nationPenalty = 0;
     for (const n of planned) {
       const d = Math.hypot(n.x - sx, n.y - sy);
-      if (d < 150) nationPenalty += (1 - d / 150) * 2500;
+      if (d < 50) nationPenalty += (1 - d / 50) * 1500;
     }
     return land + bots + coastBonus - enemyNear * 40 - nationPenalty;
+  }
+
+  /** Rough centre of every real player already on the map (rivals for land). */
+  function rivalCentres(g, mySid, ownerType) {
+    const acc = new Map();
+    const W = g.width(),
+      H = g.height();
+    for (let i = 0; i < 6000; i++) {
+      const x = Math.floor(Math.random() * W),
+        y = Math.floor(Math.random() * H);
+      const o = g.ownerID(g.ref(x, y));
+      if (o === 0 || o === mySid || ownerType(o) === PT.Bot) continue;
+      const a = acc.get(o) || { x: 0, y: 0, n: 0 };
+      a.x += x;
+      a.y += y;
+      a.n++;
+      acc.set(o, a);
+    }
+    return [...acc.values()].map((a) => ({ x: a.x / a.n, y: a.y / a.n }));
   }
 
   function chooseSpawn(g, mySid) {
@@ -830,16 +865,17 @@
     }
     screened.sort((a, b) => b.quick - a.quick);
     // Stage 2: real evaluation of the best candidates.
+    const rivals = rivalCentres(g, mySid, ownerType);
     let best = null,
       bestScore = -Infinity;
     for (const c of screened.slice(0, 18)) {
-      const sc = scoreSpawn(g, c.t, mySid, ownerType, planned);
+      const sc = scoreSpawn(g, c.t, mySid, ownerType, planned, rivals);
       if (sc > bestScore) {
         bestScore = sc;
         best = c.t;
       }
     }
-    return best === null ? null : { tile: best, score: bestScore, ownerType, planned, ranked: screened };
+    return best === null ? null : { tile: best, score: bestScore, ownerType, planned, rivals, ranked: screened };
   }
 
   function doSpawn(g) {
@@ -876,7 +912,7 @@
     const pick = chooseSpawn(g, mySid);
     if (!pick) return;
     if (brain.spawn) {
-      const current = scoreSpawn(g, brain.spawn.tile, mySid, pick.ownerType, pick.planned);
+      const current = scoreSpawn(g, brain.spawn.tile, mySid, pick.ownerType, pick.planned, pick.rivals);
       brain.plan = `Spawned – spot score ${Math.round(current)}`;
       if (brain.spawnMoves >= 3 || pick.score < current * 1.3 + 50) return;
       log(`Moving spawn: better spot found (${Math.round(current)} → ${Math.round(pick.score)})`);
@@ -938,6 +974,12 @@
       // To win a free-for-all, everyone has to go eventually: drop allies we
       // clearly outclass (always when they border us, in the endgame anywhere).
       const outclass = theirs < I.troops * (strat.stance === "Endgame" ? 0.6 : 0.4);
+      // Walled in by allies: let the weakest bordering ally's alliance lapse.
+      const weakestAlly = I.neighbors.filter((x) => x.allied).sort((x, y) => x.troops - y.troops)[0];
+      if (I.boxed && n && weakestAlly && weakestAlly.sid === n.sid && theirs < I.troops) {
+        log(`Letting alliance with ${other.displayName()} expire – need room to grow`);
+        continue;
+      }
       if (strat.stance !== "Defense" && outclass && (n || strat.stance === "Endgame")) {
         log(`Letting alliance with ${other.displayName()} expire – they are next`);
         continue;
@@ -1237,6 +1279,32 @@
       }
     }
 
+    // Breakout: walled in with nothing easy left. Hit the most takeable
+    // neighbour (weakest, busy elsewhere, traitor) even at equal strength,
+    // rather than sit at the cap while everyone else grows.
+    if (I.boxed && S.attackPlayers && I.ratio > 0.75 && brain.cd.ready("breakout", 15000)) {
+      const options = I.neighbors
+        .filter((n) => isPlayerNeighbor(n) && !(n.type === PT.Human && !S.attackHumans))
+        .filter((n) => I.troops >= n.troops * 0.9)
+        .map((n) => ({
+          n,
+          ease: (I.troops / Math.max(1, n.troops)) * (n.busy > 0 ? 1.5 : 1) * (n.traitor ? 1.3 : 1) * (1 + Math.min(1, n.contacts / 150)),
+        }))
+        .sort((a, b) => b.ease - a.ease);
+      for (const { n } of options) {
+        // Breaking out means accepting risk: keep 30% home, send up to 70%.
+        const amount = Math.floor(Math.min(I.troops * 0.7 - I.incomingTroops, n.troops * 1.75));
+        if (amount < n.troops * 0.7 || amount < I.maxTroops * 0.05) continue;
+        if (emit("attack", { targetID: n.p.id(), troops: amount })) {
+          brain.cd.mark("breakout");
+          brain.cd.mark("attack");
+          brain.target = n.p.displayName() + " (breakout)";
+          log(`🚪 Breakout: walled in, attacking ${n.p.displayName()} (${fmtTroops(n.troops)} vs our ${fmtTroops(I.troops)}) with ${fmtTroops(amount)}`);
+          return true;
+        }
+      }
+    }
+
     // Last resort at the troop cap: nothing else to do, so push through
     // nuked land (2.5-5x dearer, but capped troops are wasted anyway).
     if (overflow && I.unclaimedContacts === 0 && I.falloutContacts > 0 && !I.outgoing.some((a) => a.targetID === 0)) {
@@ -1273,7 +1341,7 @@
   // ----- naval invasions -----------------------------------------------------
   async function doBoat(g, me, I, policy, strat) {
     if (!S.boats || I.shore.length === 0) return false;
-    if (I.ratio < policy.trigger && I.ratio < 0.9) return false;
+    if (I.ratio < policy.trigger && I.ratio < 0.9 && !(I.boxed && I.ratio > 0.6)) return false;
     // Only when land targets are exhausted.
     if (I.unclaimedContacts > 0 || strat.huntBots.length > 0) return false;
     if (I.neighbors.some((n) => scoreTarget(I, n, policy.sendable, policy, strat) > 0.8)) return false;
@@ -1293,7 +1361,8 @@
     const W = g.width(),
       H = g.height();
     // Play close: landings only within a short hop of our own coast.
-    const MAX_HOP = clamp(Math.max(W, H) * 0.12, 90, 260);
+    // Boxed in by other countries: reach further to find room.
+    const MAX_HOP = clamp(Math.max(W, H) * 0.12, 90, 260) * (I.boxed ? 2.5 : 1);
     const ourShore = sampleArray(I.shore, 120);
     const cands = [];
     for (let i = 0; i < 3000 && cands.length < 220; i++) {
@@ -1992,6 +2061,16 @@
         return;
       }
       const I = await analyze(g, me);
+      // Stuck detection: no land growth for 60s with nothing easy left to take.
+      if (brain.bestLand === undefined || I.land > brain.bestLand * 1.01) {
+        brain.bestLand = I.land;
+        brain.lastProgress = I.tick;
+      }
+      I.boxed =
+        I.tick - brain.lastProgress > 600 &&
+        I.unclaimedContacts === 0 &&
+        !I.neighbors.some((n) => n.type === PT.Bot && !n.friendly && !n.walled) &&
+        I.incomingTroops < I.troops * 0.3;
       const strat = chooseStrategy(I);
       const policy = troopPolicy(I, strat);
       I.policy = policy;
