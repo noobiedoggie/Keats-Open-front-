@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront Autopilot
 // @namespace    https://github.com/noobiedoggie/keats-open-front-
-// @version      3.1.0
+// @version      3.2.0
 // @description  Fully hands-off autopilot + intel HUD for OpenFront.io: starts solo games, spawns, expands, wages war, builds, defends, nukes and requeues by itself.
 // @author       Keats
 // @match        https://openfront.io/*
@@ -277,6 +277,9 @@
     target: null,
     allianceAsked: new Map(), // playerID -> tick we last asked
     troopHistory: new Map(), // smallID -> [{tick, troops}] for trend detection
+    botWall: new Map(), // bot smallID -> {walled, tick}
+    farms: [], // bots being farmed, for the panel
+    savingCost: 0, // what the build plan is saving for
     gameEndHandled: false,
     openingSent: false,
     spawn: null,
@@ -289,6 +292,9 @@
       this.target = null;
       this.allianceAsked.clear();
       this.troopHistory.clear();
+      this.botWall.clear();
+      this.farms = [];
+      this.savingCost = 0;
       this.gameEndHandled = false;
       this.openingSent = false;
       this.review = null;
@@ -425,6 +431,53 @@
         posts: safe(() => p.units(UT.DefensePost).length, 0),
       });
     }
+
+    // Bot farming: a bot whose land touches only us (no coast, map edge, free
+    // land or other player) is annexed whole - with all its gold - the moment
+    // its territory changes. Bots never spend gold (~500/s), so a walled-in bot
+    // is a piggy bank: leave it alone, break it when the money is worth it.
+    for (const n of neighbors) {
+      if (n.type !== PT.Bot) continue;
+      const w = brain.botWall.get(n.sid);
+      if (w && tick - w.tick < 100) {
+        n.walled = w.walled;
+        n.encircling = w.encircling;
+        continue;
+      }
+      // Classify what its border touches: us, free land, others, or sea/edge.
+      let blocked = false,
+        free = 0,
+        other = 0;
+      const bt2 = await safe(() => n.p.borderTiles(), Promise.resolve({ borderTiles: [] }));
+      for (const t of bt2.borderTiles || []) {
+        if (safe(() => g.isOceanShore(t), false) || safe(() => g.isOnEdgeOfMap(t), false)) {
+          blocked = true;
+          break;
+        }
+        for (const nb of g.neighbors(t)) {
+          const o = g.ownerID(nb);
+          if (o === n.sid || o === myID) continue;
+          if (o === 0 && g.isLand(nb) && !safe(() => g.hasFallout(nb), false)) free++;
+          else if (o === 0) blocked = true; // water / fallout: can never be sealed
+          else other++;
+        }
+        if (blocked) break;
+      }
+      const walled = !blocked && other === 0 && free === 0;
+      // Inland bot touching only us and free land: our expansion will seal it,
+      // so leave it be for up to 90s instead of taking it now.
+      const since = w && w.encirclingSince !== undefined ? w.encirclingSince : tick;
+      const encircling = !blocked && other === 0 && free > 0 && tick - since < 900;
+      brain.botWall.set(n.sid, {
+        walled,
+        encircling,
+        tick,
+        encirclingSince: !blocked && other === 0 && free > 0 ? since : undefined,
+      });
+      n.walled = walled;
+      n.encircling = encircling;
+    }
+    for (const n of neighbors) if (n.type === PT.Bot) n.gold = num(safe(() => n.p.gold(), 0));
 
     // Attacks.
     const incoming = (me.incomingAttacks() || []).filter((a) => !a.retreating);
@@ -579,6 +632,7 @@
         !(I.nationImmunity && n.type === PT.Nation),
     );
     const bots = I.neighbors.filter((n) => !n.friendly && n.type === PT.Bot);
+    const huntBots = bots.filter((n) => !n.walled && !n.encircling); // walled are farmed, encircled soon
     const biggestPlayer = players.reduce((m, n) => Math.max(m, n.troops), 0);
     // A neighbour at least as strong as us that is not busy fighting someone else.
     const dangerous = players.filter(
@@ -597,7 +651,7 @@
     } else if (I.landShare > 0.3 || (I.rank === 1 && I.troops > I.strongestOther * 1.5)) {
       stance = "Endgame";
       if (S.adaptive) aggr += 2;
-    } else if (bots.length > 0) {
+    } else if (huntBots.length > 0) {
       stance = "Bot hunt";
       if (S.adaptive) aggr += 1;
     } else if (I.unclaimedContacts > 0 && I.secondsIn < 240) {
@@ -621,6 +675,7 @@
       careful,
       dangerous,
       bots,
+      huntBots,
       biggestPlayer,
     };
   }
@@ -983,11 +1038,39 @@
     const maxBotAttacks = 2 + Math.ceil(policy.aggr / 4); // 3..5
     if (botAttacks >= maxBotAttacks) return false;
     let free = Math.floor(policy.safeSendable);
-    // Weakest first: they fall fastest and free troops for the next one.
+    // Farming: walled-in bots are left to fill up with gold, then harvested.
+    const HARVEST_AT = 300_000;
+    const gap = Math.max(0, brain.savingCost - I.gold);
+    brain.farms = [];
     const bots = strat.bots
       .filter((n) => !I.outgoing.some((a) => a.targetID === n.sid))
-      .sort((a, b) => a.troops - b.troops);
+      .filter((n) => {
+        if (n.encircling) {
+          brain.farms.push({ name: n.p.displayName(), gold: n.gold, target: HARVEST_AT, encircling: true });
+          return false;
+        }
+        if (!n.walled) return true;
+        const ripe =
+          n.gold >= HARVEST_AT || // full enough
+          (gap > 0 && n.gold >= gap) || // pays for what we are saving for right now
+          (I.attackers.has(n.sid) && n.troops > I.troops * 0.1); // it got dangerous
+        if (!ripe) brain.farms.push({ name: n.p.displayName(), gold: n.gold, target: gap > 0 ? Math.min(gap, HARVEST_AT) : HARVEST_AT });
+        return ripe;
+      })
+      .sort((a, b) => (b.walled ? 1 : 0) - (a.walled ? 1 : 0) || a.troops - b.troops);
     for (const n of bots) {
+      if (n.walled) {
+        // Any bite triggers the engine's annexation of the whole bot.
+        const amount = Math.floor(Math.min(free, Math.max(n.troops * 1.3, I.maxTroops * 0.02)));
+        if (amount < n.troops * 1.1) continue;
+        if (emit("attack", { targetID: n.p.id(), troops: amount })) {
+          brain.cd.mark("bot");
+          brain.target = n.p.displayName() + " (harvest)";
+          log(`💰 Harvesting walled-in bot ${n.p.displayName()}: annex it with ${fmt(n.gold)} gold inside`);
+          return true;
+        }
+        continue;
+      }
       // Overwhelm them so the attack does not stall.
       const amount = Math.floor(Math.min(free, Math.max(n.troops * 3, I.maxTroops * 0.05)));
       if (amount < n.troops * 1.5 || amount < I.maxTroops * 0.03) continue;
@@ -1082,7 +1165,7 @@
         .filter((a) => a.targetID === 0)
         .reduce((sum, a) => sum + num(a.troops), 0);
       let amount = opening ? I.troops * 0.5 : Math.min(policy.safeSendable, I.maxTroops * 0.3 - expanding);
-      if (strat.bots.length > 0 && !opening) amount *= 0.6; // leave some for the bot hunt
+      if (strat.huntBots.length > 0 && !opening) amount *= 0.6; // leave some for the bot hunt
       amount = Math.floor(amount);
       if (amount >= I.maxTroops * 0.03) {
         if (emit("attack", { targetID: null, troops: amount })) {
@@ -1191,7 +1274,7 @@
     if (!S.boats || I.shore.length === 0) return false;
     if (I.ratio < policy.trigger && I.ratio < 0.9) return false;
     // Only when land targets are exhausted.
-    if (I.unclaimedContacts > 0 || strat.bots.length > 0) return false;
+    if (I.unclaimedContacts > 0 || strat.huntBots.length > 0) return false;
     if (I.neighbors.some((n) => scoreTarget(I, n, policy.sendable, policy, strat) > 0.8)) return false;
     if (I.mine[UT.Transport].length >= (policy.aggr >= 7 && !strat.leader ? 2 : 1)) return false;
     if (strat.leader && I.outgoing.some((a) => a.targetID !== 0 && !isBotID(I, a.targetID))) return false;
@@ -1515,6 +1598,7 @@
       if (gold < action.cost) {
         if (want.optional) continue;
         brain.plan = `Saving for ${want.type}${action.kind === "upgrade" ? " upgrade" : ""} – ${want.why} (${fmt(gold)}/${fmt(action.cost)})`;
+        brain.savingCost = action.cost;
         // Defense is urgent but not worth blocking the economy for.
         if (isDefense) continue;
         return 0;
@@ -2145,7 +2229,12 @@
 
   function relationLabel(I, n) {
     if (n.friendly) return '<span class="good">ally</span>';
-    if (n.type === PT.Bot) return '<span class="good">bot – target</span>';
+    if (n.type === PT.Bot)
+      return n.walled
+        ? '<span class="good">walled bot – farming</span>'
+        : n.encircling
+          ? '<span class="good">bot – encircling</span>'
+          : '<span class="good">bot – target</span>';
     if (I.strat && I.strat.dangerous.includes(n)) return '<span class="bad">⚠ danger – careful</span>';
     const hitting = I.attackers.get(n.sid) || 0;
     if (hitting > 0) return `<span class="bad">attacking you (${fmtTroops(hitting)})</span>`;
@@ -2212,6 +2301,7 @@
         <div class="row"><span>Land</span><span>${fmt(I.land)} tiles (${(I.landShare * 100).toFixed(1)}%) · rank ${I.rank}/${I.playerCount}</span></div>
         <div class="muted">🏙 ${m[UT.City].length} · ⚓ ${m[UT.Port].length} · 🏭 ${m[UT.Factory].length} · 🛡 ${m[UT.DefensePost].length} · 📡 ${m[UT.SAMLauncher].length} · 🚀 ${m[UT.MissileSilo].length} · 🚢 ${m[UT.Warship].length}</div>
         ${Number.isFinite(I.cityLevelCap) ? `<div class="row"><span>City levels</span><span class="${I.myCityLevels >= I.cityLevelCap ? "warn" : "muted"}">${I.myCityLevels} / ${I.cityLevelCap} (MIRV line)</span></div>` : ""}
+        ${brain.farms.length ? `<div class="sec">Farming bots 💰</div>${brain.farms.map((f) => `<div class="nb"><span>${escapeHtml(f.name)}</span><span class="good">${f.encircling ? "encircling…" : `${fmt(f.gold)} → harvest at ${fmt(f.target)}`}</span></div>`).join("")}` : ""}
         <div class="sec">Neighbours (${I.neighbors.length})${I.unclaimedContacts > 0 ? ' <span class="good">+ free land</span>' : ""}</div>
         ${nbs || '<div class="muted">none</div>'}
         ${I.enemySilos > 0 ? `<div class="warn">☢ Enemies own ${I.enemySilos} missile silo(s)</div>` : ""}
