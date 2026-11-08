@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront Autopilot
 // @namespace    https://github.com/noobiedoggie/keats-open-front-
-// @version      3.2.0
+// @version      3.2.1
 // @description  Fully hands-off autopilot + intel HUD for OpenFront.io: starts solo games, spawns, expands, wages war, builds, defends, nukes and requeues by itself.
 // @author       Keats
 // @match        https://openfront.io/*
@@ -372,7 +372,8 @@
       if (y < minY) minY = y;
       if (x > maxX) maxX = x;
       if (y > maxY) maxY = y;
-      if (g.isShore(t)) shore.push(t);
+      // Ocean coast only: a port or boat on a closed lake goes nowhere.
+      if (safe(() => g.isOceanShore(t), false)) shore.push(t);
       for (const n of g.neighbors(t)) {
         const o = g.ownerID(n);
         if (o === myID) continue;
@@ -1299,7 +1300,7 @@
       const x = Math.floor(Math.random() * W),
         y = Math.floor(Math.random() * H);
       const t = g.ref(x, y);
-      if (!g.isLand(t) || !g.isShore(t)) continue;
+      if (!g.isLand(t) || !safe(() => g.isOceanShore(t), false)) continue;
       const o = g.ownerID(t);
       if (o === I.myID) continue;
       // Nuked land is ownerless fallout, not free land (2.5-5x losses).
@@ -1364,8 +1365,10 @@
 
   /** Decide what we want next, in priority order. */
   function wantedStructures(I, policy, strat) {
+    const g0 = hook.game;
     const C = I.mine[UT.City].length;
-    const P = I.mine[UT.Port].length;
+    // A port stuck on a lake earns nothing: count ocean ports only.
+    const P = I.mine[UT.Port].filter((u) => safe(() => g0.isOceanShore(u.tile()), true)).length;
     const F = I.mine[UT.Factory].length;
     const SAM = I.mine[UT.SAMLauncher].length;
     const M = I.mine[UT.MissileSilo].length;
@@ -1512,7 +1515,7 @@
         ]) {
           if (!g.isValidCoord(px + dx, py + dy)) continue;
           const t = g.ref(px + dx, py + dy);
-          if (!g.isLand(t)) out.push(t);
+          if (!g.isLand(t) && safe(() => g.isOcean(t), true)) out.push(t);
         }
       }
     }
@@ -1542,6 +1545,8 @@
       const res = await me.buildables(t, [type]);
       const b = (res || []).find((x) => x.type === type);
       if (!b || b.canBuild === false) continue;
+      // The game may move a port to a nearby lake shore: refuse that.
+      if (type === UT.Port && !safe(() => g.isOceanShore(b.canBuild), false)) continue;
       return { tile: type === UT.Warship ? t : b.canBuild, cost: num(b.cost) };
     }
     return null;
