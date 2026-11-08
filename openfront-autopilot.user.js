@@ -1540,9 +1540,11 @@
     if (underRadar && (C < 2 || C <= P + F)) wants.push({ type: UT.City, why: "+250K max troops", cityChoice: true });
     // Nuclear program as early as the economy allows: a silo right after the
     // first two cities, then a SAM so enemy nukes can't wipe us out.
-    if (S.nukes && C >= 2 && M === 0) wants.push({ type: UT.MissileSilo, why: "nuclear program" });
-    if (S.defend && C >= 2 && SAM === 0 && (M > 0 || !S.nukes || I.enemySilos > 0)) {
-      wants.push({ type: UT.SAMLauncher, why: "air defence before enemies nuke us" });
+    // Nuclear program once the economy can carry it: a 1M silo at 2 cities
+    // froze all other building for minutes in real Hard games.
+    if (S.nukes && C >= 5 && M === 0) wants.push({ type: UT.MissileSilo, why: "nuclear program", optional: C < 8 });
+    if (S.defend && C >= 3 && SAM === 0 && I.enemySilos > 0) {
+      wants.push({ type: UT.SAMLauncher, why: "air defence: enemies have silos" });
     }
     if (coastal && P < Math.max(1, Math.round(C * 0.75))) {
       wants.push({ type: UT.Port, why: "trade income" });
