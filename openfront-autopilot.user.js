@@ -1005,7 +1005,9 @@
         // are free safety.
         if (hitting > I.troops * 0.5) continue;
         const preyRatio = strat.stance === "Endgame" ? 0.7 : 0.35;
-        if (isNeighbor && theirs < I.troops * preyRatio && strat.threat < 0.3) {
+        // Blocked or in the endgame, a weak ally anywhere is just a future
+        // wall: one game sat 30 minutes behind an ally 400x weaker.
+        if ((isNeighbor || I.boxed || strat.stance === "Endgame") && theirs < I.troops * preyRatio && strat.threat < 0.3) {
           log(`Ignored alliance from weak neighbour ${p.displayName()} (prey)`);
           continue;
         }
@@ -1033,7 +1035,7 @@
         log(`Letting alliance with ${other.displayName()} expire – need room to grow`);
         continue;
       }
-      if (strat.stance !== "Defense" && outclass && (n || strat.stance === "Endgame")) {
+      if (strat.stance !== "Defense" && outclass && (n || I.boxed || strat.stance === "Endgame")) {
         log(`Letting alliance with ${other.displayName()} expire – they are next`);
         continue;
       }
