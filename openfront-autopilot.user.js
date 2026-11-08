@@ -772,8 +772,12 @@
     // 10-20% of their cap when grabbing land, so we do the same: land is max
     // troops, and troops regrow fastest when the army is low.
     const expandFloor = (0.22 - aggr * 0.01) * I.maxTroops; // 21% .. 12%
-    const safeSendable = Math.max(0, I.troops - Math.max(expandFloor, homeGuard * 0.9));
-    return { reserve, trigger, threat, sendable, safeSendable, homeGuard, homeFactor, expandFloor, aggr };
+    // Land rush: a nation that touches free land always expands into it
+    // before attacking a player, so early on the neighbours are busy too and
+    // a big home guard only makes us slower than them.
+    const landRush = I.unclaimedContacts > 0 && I.secondsIn < 480 && I.incomingTroops < I.troops * 0.2;
+    const safeSendable = Math.max(0, I.troops - Math.max(expandFloor, homeGuard * (landRush ? 0.35 : 0.9)));
+    return { reserve, trigger, threat, sendable, safeSendable, homeGuard, homeFactor, expandFloor, aggr, landRush };
   }
 
   // ----- spawn -------------------------------------------------------------------
@@ -1266,7 +1270,9 @@
       const expanding = I.outgoing
         .filter((a) => a.targetID === 0)
         .reduce((sum, a) => sum + num(a.troops), 0);
-      let amount = opening ? I.troops * 0.5 : Math.min(policy.safeSendable, I.maxTroops * 0.3 - expanding);
+      let amount = opening
+        ? I.troops * 0.5
+        : Math.min(policy.safeSendable, I.maxTroops * (policy.landRush ? 0.45 : 0.3) - expanding);
       if (strat.huntBots.length > 0 && !opening) amount *= 0.6; // leave some for the bot hunt
       amount = Math.floor(amount);
       if (amount >= I.maxTroops * 0.03) {
@@ -2021,15 +2027,30 @@
         return;
       }
       safe(() => modal.resetOptions(), null);
-      if (S.soloMap === "random" && typeof modal.handleSelectRandomMap === "function") {
+      // "Missing medals": a map that awards medals where this difficulty has
+      // not been won yet (the solo menu's own win list).
+      let medalMap = null;
+      if (S.soloMap === "medals") {
+        if (typeof modal.ensureEligibleMaps === "function") await safe(() => modal.ensureEligibleMaps(), null);
+        const eligible = modal.eligibleMaps instanceof Set ? [...modal.eligibleMaps] : [];
+        const wins = modal.mapWins instanceof Map ? modal.mapWins : new Map();
+        const missing = eligible.filter((m) => !(wins.get(m) && wins.get(m).has(S.soloDifficulty)));
+        if (missing.length) medalMap = missing[Math.floor(Math.random() * missing.length)];
+        else log(eligible.length ? "Solo: every medal at this difficulty is won – picking a random map" : "Solo: medal list unavailable (sign in?) – random map");
+      }
+      if (medalMap) {
+        modal.selectedMap = medalMap;
+        modal.useRandomMap = false;
+        log(`Solo: going for the ${S.soloDifficulty} medal on ${medalMap}`);
+      } else if ((S.soloMap === "random" || S.soloMap === "medals") && typeof modal.handleSelectRandomMap === "function") {
         modal.handleSelectRandomMap();
-      } else if (S.soloMap !== "random") {
+      } else if (S.soloMap !== "random" && S.soloMap !== "medals") {
         modal.selectedMap = S.soloMap;
         modal.useRandomMap = false;
       }
       modal.selectedDifficulty = S.soloDifficulty;
       if (typeof modal.loadNationCount === "function") await modal.loadNationCount();
-      log(`Solo: starting a ${S.soloDifficulty} game (${S.soloMap === "random" ? "random map" : S.soloMap})`);
+      log(`Solo: starting a ${S.soloDifficulty} game (${medalMap || (S.soloMap === "World" ? "World" : "random map")})`);
       solo.status = "Solo: starting game…";
       await modal.startGame();
     } catch (e) {
@@ -2257,7 +2278,7 @@
             <option>Easy</option><option>Medium</option><option>Hard</option><option>Impossible</option>
           </select></div>
         <div class="row" style="margin-top:4px"><span>Map</span>
-          <select data-k="soloMap"><option value="random">Random</option><option value="World">World</option></select></div>
+          <select data-k="soloMap"><option value="random">Random</option><option value="medals">Missing medals</option><option value="World">World</option></select></div>
         <div class="muted" data-f="solo" style="margin-top:4px"></div>
         <div class="sec">Brain</div>
         <div class="grid">
