@@ -41,6 +41,7 @@
   const UT = {
     Transport: "Transport",
     Warship: "Warship",
+    TradeShip: "Trade Ship",
     Port: "Port",
     AtomBomb: "Atom Bomb",
     HydrogenBomb: "Hydrogen Bomb",
@@ -62,6 +63,8 @@
     UT.MissileSilo,
   ];
   const NUKE_RADIUS = { [UT.AtomBomb]: 30, [UT.HydrogenBomb]: 100, [UT.MIRV]: 60 };
+  // Warships shoot ships within 130 tiles: keep our boats and raiders further.
+  const WARSHIP_DANGER = 150;
   const TICKS_PER_SEC = 10;
 
   // ---------------------------------------------------------------------------
@@ -83,6 +86,7 @@
     requestAlliances: true, // ask much stronger neighbours for peace
     nukes: true, // silos + atom/hydrogen bombs + MIRV
     adaptive: true, // let the brain adjust aggression to the situation
+    islandMode: false, // island bunker: spawn on a remote island, guard it, raid enemy trade
     aggression: 6, // 1 = turtle, 10 = berserker
     soloLoop: false, // start solo games by itself and requeue after each one
     soloDifficulty: "Medium",
@@ -179,6 +183,7 @@
     cancelAttack: /\bonCancelAttackIntentEvent\s*\(/,
     deleteUnit: /\bonSendDeleteUnitIntent\s*\(/,
     targetPlayer: /\bonSendTargetPlayerIntent\s*\(/,
+    moveWarship: /\bonMoveWarshipEvent\s*\(/,
   };
 
   const hook = {
@@ -282,6 +287,12 @@
     farms: [], // bots being farmed, for the panel
     savingCost: 0, // what the build plan is saving for
     hitAt: new Map(), // smallID -> tick we last attacked them (their relation to us drops)
+    freeLand: new Map(), // nation smallID -> {free, tick}: still expanding into free land
+    navyRole: new Map(), // warship id -> "defend" | "raid" (island bunker)
+    navyOrders: new Map(), // warship id -> {t, at}: move orders to verify
+    navyMoved: new Map(), // warship id -> tick of the last move order
+    raidBlocked: new Set(), // raid spots our warships can't reach (other waters)
+    tradeHeat: [], // recent positions of enemy trade ships in open water
     mirvCost: 25_000_000, // the game's current MIRV price
     gameEndHandled: false,
     openingSent: false,
@@ -297,6 +308,16 @@
       this.troopHistory.clear();
       this.botWall.clear();
       this.hitAt.clear();
+      this.freeLand.clear();
+      this.navyRole.clear();
+      this.navyOrders.clear();
+      this.navyMoved.clear();
+      this.raidBlocked.clear();
+      this.tradeHeat = [];
+      this.islands = undefined;
+      this.islandComp = undefined;
+      this.islandMissLogged = false;
+      this.islandExitLogged = false;
       this.mirvCost = 25_000_000;
       this.mirvCostAt = undefined;
       this.farms = [];
@@ -490,6 +511,29 @@
       n.encircling = encircling;
     }
     for (const n of neighbors) if (n.type === PT.Bot) n.gold = num(safe(() => n.p.gold(), 0));
+
+    // A nation touching free land always expands into it before it attacks a
+    // player (the engine's nation AI), so it is no threat until that is gone.
+    for (const n of neighbors) {
+      if (n.type !== PT.Nation) continue;
+      const c = brain.freeLand.get(n.sid);
+      if (c && tick - c.tick < 100) {
+        n.freeLand = c.free;
+        continue;
+      }
+      let free = false;
+      const bt3 = await n.p.borderTiles().catch(() => ({ borderTiles: [] }));
+      scan: for (const t of bt3.borderTiles || []) {
+        for (const nb of g.neighbors(t)) {
+          if (g.ownerID(nb) === 0 && g.isLand(nb) && !safe(() => g.isImpassable(nb), false) && !safe(() => g.hasFallout(nb), false)) {
+            free = true;
+            break scan;
+          }
+        }
+      }
+      brain.freeLand.set(n.sid, { free, tick });
+      n.freeLand = free;
+    }
 
     // Attacks.
     const incoming = (me.incomingAttacks() || []).filter((a) => !a.retreating);
@@ -738,12 +782,15 @@
     );
     const bots = I.neighbors.filter((n) => !n.friendly && n.type === PT.Bot);
     const huntBots = bots.filter((n) => !n.walled && !n.encircling); // walled are farmed, encircled soon
-    const biggestPlayer = players.reduce((m, n) => Math.max(m, n.troops), 0);
+    // A nation still touching free land expands into it before it attacks
+    // any player: it is no threat yet (early on, every army grows fast).
+    const armed = players.filter((n) => !n.freeLand);
+    const biggestPlayer = armed.reduce((m, n) => Math.max(m, n.troops), 0);
     // A neighbour at least as strong as us that is not busy fighting someone else.
-    const dangerous = players.filter(
+    const dangerous = armed.filter(
       (n) => n.troops > I.troops * 0.9 && n.busy < n.troops * 0.4,
     );
-    const massing = players.some((n) => n.trend > 0.35 && n.troops > I.troops * 0.8);
+    const massing = armed.some((n) => n.trend > 0.35 && n.troops > I.troops * 0.8);
     const careful = dangerous.length > 0;
     let aggr = clamp(S.aggression, 1, 10);
     let stance;
@@ -834,8 +881,13 @@
       reserve = Math.max(reserve, 0.5);
       trigger = Math.max(trigger, reserve + 0.15);
     }
-    // Early land grab: unclaimed land is cheap, expand faster.
-    if (I.unclaimedContacts > 0 && I.neighbors.length === 0) {
+    // Land rush: a nation that touches free land always expands into it
+    // before it attacks any player, so early on the neighbours are busy too
+    // and a big home army only makes us slower than them.
+    const landRush = I.unclaimedContacts > 0 && I.secondsIn < 480 && I.incomingTroops < I.troops * 0.2;
+    // Player neighbours that could attack us now (not busy with free land).
+    const armed = I.neighbors.filter((n) => isPlayerNeighbor(n) && !n.freeLand);
+    if (landRush && armed.length === 0) {
       reserve -= 0.08;
       trigger -= 0.12;
     }
@@ -849,25 +901,19 @@
     // save us anyway, while eating bots makes us bigger.
     let homeGuard = Math.min(strat.biggestPlayer * homeFactor, I.troops * 0.6) + I.incomingTroops;
     if (strat.crowned) homeGuard = Math.max(homeGuard, Math.min(strat.borderNationTroops * 0.5, I.troops * 0.8));
-    // Land rush: a nation that touches free land always expands into it
-    // before attacking a player, so early on the neighbours are busy too and
-    // a big home guard only makes us slower than them.
-    const landRush = I.unclaimedContacts > 0 && I.secondsIn < 480 && I.incomingTroops < I.troops * 0.2;
     // Hard and Impossible nations go after a player whose troops drop under
-    // 15% of its own cap ("very weak") ahead of nearly every other target:
-    // never look like that while a nation can reach us (just at the line
-    // during the land rush, when they are busy with free land).
+    // 15% of its own cap ("very weak") ahead of nearly every other target.
+    // Once a nation next door has no free land left, never look like that.
     const weakFloor =
-      (I.difficulty === "Hard" || I.difficulty === "Impossible") &&
-      I.neighbors.some((n) => !n.friendly && n.type === PT.Nation)
-        ? (landRush ? 0.15 : 0.18) * I.maxTroops
+      (I.difficulty === "Hard" || I.difficulty === "Impossible") && armed.some((n) => n.type === PT.Nation)
+        ? 0.17 * I.maxTroops
         : 0;
     // Troops free for player wars: above both the growth reserve and the guard.
     const sendable = Math.max(0, I.troops - Math.max(reserve * I.maxTroops, homeGuard, weakFloor));
     // Troops free for bots / free land. The game's own nations keep only
     // 10-20% of their cap when grabbing land, so we do the same: land is max
     // troops, and troops regrow fastest when the army is low.
-    const expandFloor = Math.max((0.22 - aggr * 0.01) * I.maxTroops, weakFloor); // 21% .. 12%
+    const expandFloor = Math.max((landRush ? 0.1 : 0.22 - aggr * 0.01) * I.maxTroops, weakFloor); // 21% .. 12%
     const safeSendable = Math.max(0, I.troops - Math.max(expandFloor, homeGuard * (landRush ? 0.35 : 0.9)));
     return { reserve, trigger, threat, sendable, safeSendable, homeGuard, homeFactor, expandFloor, weakFloor, aggr, landRush };
   }
@@ -1023,6 +1069,124 @@
     return best === null ? null : { tile: best, score: bestScore, ownerType, planned, rivals, ranked: screened };
   }
 
+  // ----- island bunker spawn ----------------------------------------------------
+  /**
+   * Every ocean island of the map (land not connected on foot to bigger
+   * land), with its size, centre, coast sample and the sea gap to the nearest
+   * other land. Computed once per game: a flood fill of the map.
+   */
+  function findIslands(g) {
+    const W = g.width(),
+      H = g.height(),
+      N = W * H;
+    const imp = typeof g.isImpassable === "function";
+    const walk = (t) => g.isLand(t) && !(imp && g.isImpassable(t));
+    const comp = new Int32Array(N).fill(-1);
+    const queue = new Int32Array(N);
+    const out = [];
+    let id = 0;
+    for (let s0 = 0; s0 < N; s0++) {
+      if (comp[s0] !== -1 || !walk(s0)) continue;
+      let head = 0,
+        tail = 0,
+        size = 0,
+        sx = 0,
+        sy = 0,
+        coast = false;
+      const sample = [],
+        shore = [];
+      const step = (n) => {
+        if (comp[n] !== -1) return;
+        if (walk(n)) {
+          comp[n] = id;
+          queue[tail++] = n;
+        } else if (!g.isLand(n)) coast = true;
+      };
+      comp[s0] = id;
+      queue[tail++] = s0;
+      while (head < tail) {
+        const t = queue[head++];
+        size++;
+        const x = t % W,
+          y = (t - x) / W;
+        sx += x;
+        sy += y;
+        if (sample.length < 64) sample.push(t);
+        else if (Math.random() < 64 / size) sample[Math.floor(Math.random() * 64)] = t;
+        coast = false;
+        if (x > 0) step(t - 1);
+        if (x < W - 1) step(t + 1);
+        if (y > 0) step(t - W);
+        if (y < H - 1) step(t + W);
+        if (coast && safe(() => g.isOceanShore(t), false)) {
+          if (shore.length < 24) shore.push(t);
+          else if (Math.random() < 0.05) shore[Math.floor(Math.random() * 24)] = t;
+        }
+      }
+      if (shore.length && size >= 80 && size <= 40000) out.push({ id, size, cx: sx / size, cy: sy / size, sample, shore });
+      id++;
+    }
+    // Sea gap: rays from the coast until they hit land of another island.
+    for (const isl of out) {
+      let gap = 420;
+      for (const t of isl.shore.slice(0, 12)) {
+        const x0 = t % W,
+          y0 = (t - x0) / W;
+        for (let k = 0; k < 16; k++) {
+          const dx = Math.cos((k * Math.PI) / 8),
+            dy = Math.sin((k * Math.PI) / 8);
+          for (let r = 3; r < gap; r += 2) {
+            const x = Math.round(x0 + dx * r),
+              y = Math.round(y0 + dy * r);
+            if (x < 0 || y < 0 || x >= W || y >= H) break;
+            const u = y * W + x;
+            if (g.isLand(u) && comp[u] !== isl.id) {
+              gap = r;
+              break;
+            }
+          }
+        }
+      }
+      isl.gap = gap;
+    }
+    brain.islandComp = comp;
+    return out;
+  }
+
+  /**
+   * Island bunker: a small ocean island well away from other land. Nations
+   * pick random boat targets within ~150 tiles of their own coast, so a wide
+   * gap keeps most landings away (Hard/Impossible nations with no enemy on
+   * their border still go for the nearest player, so it helps without making
+   * the island untouchable). Too far from everyone and no trade passes by
+   * for the raiders.
+   */
+  function chooseIslandSpawn(g, mySid) {
+    if (brain.islands === undefined) brain.islands = findIslands(g);
+    const planned = plannedNationSpots(g);
+    const typeOf = (sid) => safe(() => g.playerBySmallID(sid).type(), PT.Nation);
+    let best = null;
+    for (const isl of brain.islands) {
+      if (isl.gap < 45) continue; // a short hop from other land: no bunker
+      // A nation will spawn there, or another player already lives there.
+      if (planned.some((p) => brain.islandComp[g.ref(p.x, p.y)] === isl.id)) continue;
+      if (isl.sample.some((t) => { const o = g.ownerID(t); return o !== 0 && o !== mySid && typeOf(o) !== PT.Bot; })) continue;
+      const score =
+        (Math.min(isl.size, 6000) / 6000) * 400 -
+        Math.max(0, isl.size - 25000) / 40 +
+        Math.min(isl.gap, 220) * 4 -
+        Math.max(0, isl.gap - 380) * 3;
+      if (!best || score > best.score) best = { isl, score };
+    }
+    if (!best) return null;
+    const { isl } = best;
+    // Spawn spots: free land of the island, most central first.
+    const tiles = isl.sample
+      .filter((t) => g.ownerID(t) === 0 || g.ownerID(t) === mySid)
+      .sort((a, b) => Math.hypot(g.x(a) - isl.cx, g.y(a) - isl.cy) - Math.hypot(g.x(b) - isl.cx, g.y(b) - isl.cy));
+    return tiles.length ? { tiles, size: isl.size, gap: isl.gap, score: best.score } : null;
+  }
+
   function doSpawn(g) {
     if (!S.autoSpawn) {
       brain.plan = "Spawn phase (auto-spawn off)";
@@ -1052,6 +1216,22 @@
     // the spawn can be moved until the game starts.
     if (!brain.cd.ready("spawn", brain.spawn ? 5000 : 1500)) return;
     brain.cd.mark("spawn");
+    if (S.islandMode) {
+      if (brain.spawn) return; // never move off the island
+      const isl = chooseIslandSpawn(g, meNow ? meNow.smallID() : -1);
+      const tries = brain.spawnFailed || 0;
+      if (isl && tries < isl.tiles.length) {
+        const tile = isl.tiles[tries];
+        if (emit("spawn", { tile })) {
+          brain.spawn = { tile, at: gameNow(), score: isl.score };
+          brain.plan = `Island bunker: spawned on an island of ${fmt(isl.size)} tiles, ${isl.gap >= 420 ? "420+" : isl.gap} tiles of sea from other land`;
+          log(brain.plan);
+        }
+        return;
+      }
+      if (!brain.islandMissLogged) log("Island bunker: no suitable island on this map – normal spawn");
+      brain.islandMissLogged = true;
+    }
     const me = g.myPlayer();
     const mySid = me ? me.smallID() : -1;
     const pick = chooseSpawn(g, mySid);
@@ -1081,6 +1261,9 @@
     if (!brain.cd.ready("diplo", 2500)) return;
     brain.cd.mark("diplo");
     const neighborBySid = new Map(I.neighbors.map((n) => [n.sid, n]));
+    // Island bunker: as few alliances as possible (an ally's trade ships
+    // can't be raided), except with whoever is a real danger right now.
+    const threats = S.islandMode ? islandThreats(g, me, I) : null;
 
     if (S.acceptAlliances) {
       for (const p of g.players()) {
@@ -1089,6 +1272,10 @@
         const key = "accept:" + p.id();
         if (!brain.cd.ready(key, 15000)) continue;
         brain.cd.mark(key);
+        if (threats && !threats.has(p.smallID())) {
+          log(`Island bunker: ignored alliance from ${p.displayName()} (its trade is ours to raid)`);
+          continue;
+        }
         const isNeighbor = neighborBySid.has(p.smallID());
         const theirs = num(p.troops());
         // Refuse weak neighbours we are about to eat (an alliance would block
@@ -1114,6 +1301,10 @@
       const other = safe(() => g.player(a.other), null);
       if (!other) continue;
       brain.cd.mark(key);
+      if (threats && !threats.has(other.smallID())) {
+        log(`Island bunker: letting the alliance with ${other.displayName()} expire (its trade is ours to raid)`);
+        continue;
+      }
       const n = neighborBySid.get(other.smallID());
       const theirs = num(other.troops());
       // To win a free-for-all, everyone has to go eventually: drop allies we
@@ -1161,7 +1352,11 @@
       const cands =
         capped || runaway
           ? []
-          : I.neighbors
+          : threats
+            ? [...threats.values()]
+                .filter(({ p }) => !safe(() => me.isFriendly(p), false))
+                .map(({ p, why }) => ({ p, sid: p.smallID(), troops: num(p.troops()), why }))
+            : I.neighbors
               .filter((n) => !n.friendly && n.type !== PT.Bot && !warOn.has(n.sid))
               .filter((n) => {
                 const hitting = I.attackers.get(n.sid) || 0;
@@ -1178,7 +1373,7 @@
         brain.allianceAsked.set(n.p.id(), I.tick);
         emit("allianceRequest", { requestor: me, recipient: n.p });
         const hitting = I.attackers.get(n.sid) || 0;
-        log(`Requested alliance with ${n.p.displayName()} (${hitting ? "attacking us" : n.troops > I.troops ? "stronger" : "a real threat"})`);
+        log(`Requested alliance with ${n.p.displayName()} (${n.why || (hitting ? "attacking us" : n.troops > I.troops ? "stronger" : "a real threat")})`);
         break; // one per cycle
       }
     }
@@ -1283,13 +1478,13 @@
   }
 
   /** Priority 1: hit every bot next to us, hard, in parallel. */
-  function doBotHunt(g, me, I, policy, strat) {
+  function doBotHunt(g, me, I, policy, strat, alreadySent = 0) {
     if (!S.attackPlayers || strat.bots.length === 0) return false;
     if (!brain.cd.ready("bot", 1500)) return false;
     const botAttacks = I.outgoing.filter((a) => isBotID(I, a.targetID)).length;
     const maxBotAttacks = 2 + Math.ceil(policy.aggr / 4); // 3..5
     if (botAttacks >= maxBotAttacks) return false;
-    let free = Math.floor(policy.safeSendable);
+    let free = Math.floor(policy.safeSendable - alreadySent);
     // Farming: walled-in bots are left to fill up with gold, then harvested.
     const HARVEST_AT = 300_000;
     const gap = Math.max(0, brain.savingCost - I.gold);
@@ -1400,42 +1595,43 @@
       }
     }
 
-    // 1) Bots first, always.
-    if (doBotHunt(g, me, I, policy, strat)) return true;
-
-    const nonBotAttacks = I.outgoing.filter((a) => !isBotID(I, a.targetID)).length;
-    // Leading: one war at a time, never spread thin.
-    const maxConcurrent = strat.leader ? 1 : 1 + Math.ceil(aggr / 5); // 1..3
-    if (nonBotAttacks >= maxConcurrent) return false;
-
-    // Near the cap troops stop growing, so anything above it is wasted.
-    const overflow = I.ratio >= 0.9;
-
-    // 2) Unclaimed land, like the game's nations do it: half the army goes out
+    // 1) Free land, like the game's nations do it: half the army goes out
     // the moment the game starts, then everything above the expansion floor
-    // every few seconds (attacks on the same target merge in the game).
-    if (S.expand && I.unclaimedContacts > 0 && !strat.decapitate && !strat.crownHold && brain.cd.ready("expand", 1500 + (10 - aggr) * 150)) {
+    // every second during the land rush (attacks on the same target merge).
+    // Tribes get what is left in the same cycle.
+    let expandSent = 0;
+    const expandCd = policy.landRush ? 1000 : 1500 + (10 - aggr) * 150;
+    if (S.expand && I.unclaimedContacts > 0 && !strat.decapitate && !strat.crownHold && brain.cd.ready("expand", expandCd)) {
       const opening = !brain.openingSent;
       // Free land costs only ~16-25 troops per tile, so a modest stack is
       // enough; topping up a huge one just parks troops that stop regrowing.
       const expanding = I.outgoing
         .filter((a) => a.targetID === 0)
         .reduce((sum, a) => sum + num(a.troops), 0);
-      let amount = opening
-        ? I.troops * 0.5
-        : Math.min(policy.safeSendable, I.maxTroops * (policy.landRush ? 0.45 : 0.3) - expanding);
-      if (strat.huntBots.length > 0 && !opening) amount *= 0.6; // leave some for the bot hunt
-      amount = Math.floor(amount);
-      if (amount >= I.maxTroops * 0.03) {
-        if (emit("attack", { targetID: null, troops: amount })) {
-          brain.cd.mark("expand");
-          brain.openingSent = true;
-          brain.target = "free land";
-          log(`${opening ? "Opening rush: " : ""}expanding into free land with ${fmtTroops(amount)} troops`);
-          return true;
-        }
+      const amount = Math.floor(
+        opening ? I.troops * 0.5 : Math.min(policy.safeSendable, I.maxTroops * (policy.landRush ? 0.45 : 0.3) - expanding),
+      );
+      if (amount >= I.maxTroops * 0.03 && emit("attack", { targetID: null, troops: amount })) {
+        brain.cd.mark("expand");
+        brain.openingSent = true;
+        brain.target = "free land";
+        expandSent = amount;
+        log(`${opening ? "Opening rush: " : ""}expanding into free land with ${fmtTroops(amount)} troops`);
       }
     }
+
+    // 2) Tribes, with what the expansion left.
+    if (doBotHunt(g, me, I, policy, strat, expandSent)) return true;
+    if (expandSent > 0) return true;
+
+    // Free land and tribes don't count as wars.
+    const nonBotAttacks = I.outgoing.filter((a) => a.targetID !== 0 && !isBotID(I, a.targetID)).length;
+    // Leading: one war at a time, never spread thin.
+    const maxConcurrent = strat.leader ? 1 : 1 + Math.ceil(aggr / 5); // 1..3
+    if (nonBotAttacks >= maxConcurrent) return false;
+
+    // Near the cap troops stop growing, so anything above it is wasted.
+    const overflow = I.ratio >= 0.9;
 
     if (!brain.cd.ready("attack", 2500 + (10 - aggr) * 350)) return false;
 
@@ -1586,7 +1782,6 @@
       .units(UT.Warship)
       .filter((u) => u.owner() && u.owner().smallID() !== I.myID && !safe(() => me.isFriendly(u.owner()), false))
       .map((u) => u.tile());
-    const WARSHIP_DANGER = 150;
     const W = g.width(),
       H = g.height();
     // Play close: landings only within a short hop of our own coast.
@@ -1611,6 +1806,8 @@
         if (I.immunity) continue;
         const theirs = num(p.troops());
         const isBot = p.type() === PT.Bot;
+        // Island bunker: no landings on players until the breakout phase.
+        if (S.islandMode && !isBot && !I.islandExit) continue;
         // Bots across the sea are fair game; players only if we clearly outclass them.
         if (!isBot && I.troops < theirs * strengthNeeded(policy, { busy: 0, troops: theirs })) continue;
         const odds = amount / Math.max(1, theirs);
@@ -1653,6 +1850,206 @@
     return false;
   }
 
+  // ----- island bunker navy ------------------------------------------------------
+  /**
+   * A warship captures an enemy trade ship it gets within 5 tiles of, if the
+   * ship is within 100 tiles of the warship's patrol spot (a move order sets
+   * that spot) - but only in open water: a trade ship stays safe for 2s after
+   * passing a shoreline tile. It can't take ships of allies, nor ships bound
+   * for an ally's port. A move order also cancels a trip to port for repairs,
+   * so damaged or repairing warships are left alone.
+   */
+  const DIRS8 = [[1, 0], [-1, 0], [0, 1], [0, -1], [0.7, 0.7], [0.7, -0.7], [-0.7, 0.7], [-0.7, -0.7]];
+  function nearLand(g, t, r) {
+    const x0 = g.x(t),
+      y0 = g.y(t);
+    for (const d of [r / 2, r]) {
+      for (const [dx, dy] of DIRS8) {
+        const x = Math.round(x0 + dx * d),
+          y = Math.round(y0 + dy * d);
+        if (g.isValidCoord(x, y) && g.isLand(g.ref(x, y))) return true;
+      }
+    }
+    return false;
+  }
+  /** Ocean water right next to a port, for a coast guard. */
+  function waterNear(g, port) {
+    const px = g.x(port),
+      py = g.y(port);
+    for (let r = 3; r <= 12; r += 3) {
+      for (const [dx, dy] of DIRS8) {
+        const x = Math.round(px + dx * r),
+          y = Math.round(py + dy * r);
+        if (!g.isValidCoord(x, y)) continue;
+        const t = g.ref(x, y);
+        if (!g.isLand(t) && safe(() => g.isOcean(t), true)) return t;
+      }
+    }
+    return null;
+  }
+  const spotKey = (g, t) => Math.floor(g.x(t) / 50) + "," + Math.floor(g.y(t) / 50);
+
+  /** Remember where enemy trade ships sail in open water: their trade routes. */
+  function noteTrade(g, me) {
+    if (!brain.cd.ready("tradeScan", 2000)) return;
+    brain.cd.mark("tradeScan");
+    const tick = g.ticks();
+    for (const u of g.units(UT.TradeShip)) {
+      const o = safe(() => u.owner(), null);
+      if (!o || o === me || safe(() => me.isFriendly(o), true)) continue;
+      const dstId = safe(() => u.targetUnitId(), undefined);
+      const dst = dstId !== undefined ? safe(() => g.unit(dstId), null) : null;
+      const to = dst ? safe(() => dst.owner(), null) : null;
+      if (to && (to === me || safe(() => me.isFriendly(to), false))) continue;
+      const t = u.tile();
+      if (nearLand(g, t, 14)) continue; // hugging a coast: safe from pirates
+      brain.tradeHeat.push({ x: g.x(t), y: g.y(t), tick });
+    }
+    const cut = tick - 1200; // the last 2 minutes
+    let i = 0;
+    while (i < brain.tradeHeat.length && brain.tradeHeat[i].tick < cut) i++;
+    if (i) brain.tradeHeat.splice(0, i);
+    if (brain.tradeHeat.length > 3000) brain.tradeHeat.splice(0, brain.tradeHeat.length - 3000);
+  }
+
+  /** The busiest stretches of enemy trade routes, away from enemy warships. */
+  function raidSpots(g, me, n) {
+    if (n <= 0 || brain.tradeHeat.length < 20) return [];
+    const cells = new Map();
+    for (const p of brain.tradeHeat) {
+      const k = Math.floor(p.x / 50) + "," + Math.floor(p.y / 50);
+      let c = cells.get(k);
+      if (!c) cells.set(k, (c = { n: 0, x: 0, y: 0 }));
+      c.n++;
+      c.x += p.x;
+      c.y += p.y;
+    }
+    const guards = g
+      .units(UT.Warship)
+      .filter((u) => u.owner() && u.owner() !== me && !safe(() => me.isFriendly(u.owner()), false))
+      .map((u) => u.tile());
+    const spots = [];
+    for (const c of [...cells.values()].sort((a, b) => b.n - a.n)) {
+      if (spots.length >= n || c.n < 3) break;
+      const x = Math.round(c.x / c.n),
+        y = Math.round(c.y / c.n);
+      if (!g.isValidCoord(x, y)) continue;
+      const t = g.ref(x, y);
+      if (g.isLand(t) || !safe(() => g.isOcean(t), true)) continue;
+      if (brain.raidBlocked.has(spotKey(g, t))) continue;
+      if (guards.some((w) => dist(g, w, t) < WARSHIP_DANGER)) continue;
+      if (spots.some((o) => dist(g, o.t, t) < 150)) continue; // patrols reach 100 tiles
+      spots.push({ t, n: c.n });
+    }
+    return spots;
+  }
+
+  /**
+   * Island bunker fleet: the first two warships guard our ports, every other
+   * one raids the busiest enemy trade route it can reach. A sunk guard is
+   * replaced by the next warship built.
+   */
+  function doNavy(g, me, I) {
+    if (!S.islandMode) return;
+    noteTrade(g, me);
+    if (!hook.ctors.moveWarship || !brain.cd.ready("navy", 5000)) return;
+    brain.cd.mark("navy");
+    const ships = I.mine[UT.Warship].filter((u) => u.id && safe(() => u.isActive(), true));
+    const alive = new Set(ships.map((u) => u.id()));
+    for (const id of [...brain.navyRole.keys()]) if (!alive.has(id)) brain.navyRole.delete(id);
+    let guards = [...brain.navyRole.values()].filter((r) => r === "defend").length;
+    for (const u of ships) {
+      if (brain.navyRole.has(u.id())) continue;
+      const role = guards < 2 ? "defend" : "raid";
+      if (role === "defend") guards++;
+      brain.navyRole.set(u.id(), role);
+      log(role === "defend" ? "⚓ New warship guards the island" : "🏴‍☠️ New warship joins the raiders");
+    }
+    const ports = I.mine[UT.Port].filter((u) => u.id).map((u) => u.tile());
+    if (!ports.length) return;
+    const patrolOf = (u) => safe(() => u.warshipState().patrolTile, undefined) ?? u.tile();
+    // Orders the game ignored: that spot is on waters this warship can't reach.
+    for (const [id, o] of brain.navyOrders) {
+      if (I.tick - o.at < 30) continue;
+      const u = ships.find((x) => x.id() === id);
+      if (u && patrolOf(u) !== o.t) brain.raidBlocked.add(spotKey(g, o.t));
+      brain.navyOrders.delete(id);
+    }
+    const ready = (u) =>
+      safe(() => u.warshipState().state, "patrolling") === "patrolling" && safe(() => u.health(), 1000) >= 850 && !brain.navyOrders.has(u.id());
+    const order = (u, t) => {
+      if (!emit("moveWarship", { unitIds: [u.id()], tile: t })) return false;
+      brain.navyOrders.set(u.id(), { t, at: I.tick });
+      brain.navyMoved.set(u.id(), I.tick);
+      return true;
+    };
+    // Guards: spread over our ports, each within 40 tiles of one.
+    ships
+      .filter((u) => brain.navyRole.get(u.id()) === "defend")
+      .forEach((u, i) => {
+        const port = ports[i % ports.length];
+        if (!ready(u) || dist(g, patrolOf(u), port) <= 40) return;
+        const w = waterNear(g, port);
+        if (w !== null) order(u, w);
+      });
+    // Raiders: each on its own busy stretch of an enemy trade route.
+    const raiders = ships.filter((u) => brain.navyRole.get(u.id()) === "raid");
+    const spots = raidSpots(g, me, raiders.length);
+    const taken = new Set();
+    for (const u of raiders) {
+      const here = spots.findIndex((sp, i) => !taken.has(i) && dist(g, sp.t, patrolOf(u)) < 80);
+      if (here >= 0) {
+        taken.add(here); // still busy and unguarded: stay
+        continue;
+      }
+      const moved = brain.navyMoved.get(u.id());
+      if (!ready(u) || (moved !== undefined && I.tick - moved < 300)) continue;
+      let best = -1,
+        bd = Infinity;
+      spots.forEach((sp, i) => {
+        const d = dist(g, sp.t, u.tile());
+        if (!taken.has(i) && d < bd) [best, bd] = [i, d];
+      });
+      if (best >= 0) {
+        taken.add(best);
+        const t = spots[best].t;
+        if (order(u, t)) log(`🏴‍☠️ Raider sent to an enemy trade route at (${g.x(t)}, ${g.y(t)})`);
+      } else if (minDist(g, patrolOf(u), ports, Infinity) > 60) {
+        // Nothing to raid (or it got guarded): wait at home.
+        const w = waterNear(g, ports[0]);
+        if (w !== null) order(u, w);
+      }
+    }
+  }
+
+  /** Island bunker: players who are a real danger right now, and why. */
+  function islandThreats(g, me, I) {
+    const out = new Map();
+    const add = (p, why) => {
+      if (p && p.isPlayer && p.isPlayer() && p !== me && p.type() !== PT.Bot && !out.has(p.smallID())) out.set(p.smallID(), { p, why });
+    };
+    for (const [sid, troops] of I.attackers) if (troops > I.troops * 0.05) add(safe(() => g.playerBySmallID(sid), null), "attacking us");
+    for (const u of g.units(UT.Transport)) {
+      const tt = safe(() => u.targetTile(), undefined);
+      if (tt === undefined || g.ownerID(tt) !== I.myID) continue;
+      if (num(safe(() => u.troops(), 0)) > I.troops * 0.1) add(u.owner(), "an army sails to the island");
+    }
+    for (const u of g.units(UT.AtomBomb, UT.HydrogenBomb, UT.MIRV, UT.MIRVWarhead)) {
+      const tt = safe(() => u.targetTile(), undefined);
+      if (tt !== undefined && g.ownerID(tt) === I.myID) add(u.owner(), "a nuke flies at us");
+    }
+    const ports = I.mine[UT.Port].filter((u) => u.id).map((u) => u.tile());
+    const guards = [...brain.navyRole.values()].filter((r) => r === "defend").length;
+    const near = new Map();
+    for (const u of g.units(UT.Warship)) {
+      const o = u.owner();
+      if (!o || o === me || safe(() => me.isFriendly(o), false)) continue;
+      if (ports.length && minDist(g, u.tile(), ports, 151) <= 150) near.set(o, (near.get(o) || 0) + 1);
+    }
+    for (const [o, n] of near) if (n > guards) add(o, "more warships at our ports than our guards");
+    return out;
+  }
+
   // ----- building ---------------------------------------------------------------
   function structureCount(I) {
     return STRUCTURES.reduce(
@@ -1672,6 +2069,7 @@
       : I.neighbors.filter(
           (n) =>
             isPlayerNeighbor(n) &&
+            (strat.crowned || !n.freeLand) &&
             (strat.crowned ||
               strat.dangerous.includes(n) ||
               n.troops > I.troops * 1.2 ||
@@ -1712,8 +2110,13 @@
     if (hot && hot.any && hot.coverage < 0.8 && D < Math.min(30, 3 + Math.ceil(hot.contacts / 40))) {
       wants.push({ type: UT.DefensePost, why: `under attack: front ${pct(hot.coverage)} covered`, front: hot.uncovered });
     }
+    // Island bunker: a port first, then two warships to guard the coast.
+    const island = S.islandMode && coastal;
+    if (island && P === 0) wants.push({ type: UT.Port, why: "island bunker: first port" });
+    // SAMs are worth saving for when bombs can come: the economy otherwise
+    // spends every coin on cheaper things first and never gets there.
     if (S.defend && I.nukesAtUs > 0 && SAM < C + 1) {
-      wants.push({ type: UT.SAMLauncher, why: "nukes incoming" });
+      wants.push({ type: UT.SAMLauncher, why: "nukes incoming", save: true });
     }
     // A nation saving up for a MIRV at us and a shield we can finish soon:
     // save for it before anything else (half a shield stops nothing).
@@ -1727,9 +2130,21 @@
     }
     const samTarget = strat.crowned || strat.decapitate ? Math.ceil(C * 0.7) : strat.leader ? Math.ceil(C * 0.5) : Math.ceil(C * 0.35);
     if (S.defend && I.enemySilos > 0 && SAM < Math.max(1, samTarget)) {
-      wants.push({ type: UT.SAMLauncher, why: strat.leader ? "leader: MIRV shield" : "enemies have nukes" });
+      wants.push({ type: UT.SAMLauncher, why: strat.leader ? "leader: MIRV shield" : "enemies have nukes", save: SAM === 0 });
     }
     if (C === 0) wants.push({ type: UT.City, why: "first city" });
+    // (The first city costs 125K and nearly triples the troop cap: it goes
+    // before the two warships, 750K together.)
+    if (island && P > 0 && S.warships && WS < 2) wants.push({ type: UT.Warship, why: "island bunker: coast guard", save: true });
+    // A first SAM near the cities before anyone shows a silo: nations build
+    // theirs quietly, and the first bomb usually goes for the economy.
+    if (S.defend && C >= 5 && SAM === 0) wants.push({ type: UT.SAMLauncher, why: "preventive air defence (5+ cities)", save: true });
+    // No ocean coast means no trade ships: trains have to replace them. Each
+    // factory sends trains that earn 10K gold per stop at our own cities and
+    // ports (25K at other players', 35K at allies'), so with no sea access, or
+    // on the island, a factory per city comes before more cities.
+    const trainEconomy = !coastal || island;
+    if (trainEconomy && C >= 1 && F < C) wants.push({ type: UT.Factory, why: coastal ? "island bunker: trains" : "no sea access: trains replace sea trade" });
     // Each city level adds 250K max troops: by far the best buy in the game.
     // Keep at least as many cities as ports + factories. A solid MIRV shield
     // makes the nations' city-lead line harmless.
@@ -1760,16 +2175,25 @@
     // froze all other building for minutes in real Hard games.
     if (S.nukes && C >= 5 && M === 0) wants.push({ type: UT.MissileSilo, why: "nuclear program", optional: C < 8 });
     if (S.defend && C >= 3 && SAM === 0 && I.enemySilos > 0) {
-      wants.push({ type: UT.SAMLauncher, why: "air defence: enemies have silos" });
+      wants.push({ type: UT.SAMLauncher, why: "air defence: enemies have silos", save: true });
     }
     if (coastal && P < Math.max(1, Math.round(C * 0.75))) {
       wants.push({ type: UT.Port, why: "trade income" });
     }
-    if (S.warships && P > 0 && WS < Math.min(4, Math.ceil(P / 2) + (I.enemyNavy > 2 ? 1 : 0))) {
+    if (island) {
+      // Island bunker: more warships go raiding enemy trade routes, as long
+      // as there are trade ships to take.
+      const raiders = brain.tradeHeat.length > 20 ? Math.min(6, 1 + Math.floor(C / 2)) : 0;
+      if (S.warships && P > 0 && WS < 2 + raiders) wants.push({ type: UT.Warship, why: "island bunker: raider for enemy trade" });
+    } else if (S.warships && P > 0 && WS < Math.min(4, Math.ceil(P / 2) + (I.enemyNavy > 2 ? 1 : 0))) {
       if (I.enemyNavy > 0 || P >= 2) wants.push({ type: UT.Warship, why: "protect trade & coast" });
     }
     if (C >= 2 && F < Math.round(C * 0.6)) {
       wants.push({ type: UT.Factory, why: "train income" });
+    }
+    // With no sea trade, extra factories beyond one per city still pay.
+    if (trainEconomy && C >= 3 && F < Math.ceil(C * 1.5)) {
+      wants.push({ type: UT.Factory, why: "more trains (no sea trade)", optional: true });
     }
     // Fortify the border with a neighbour that is massing an army.
     if (S.nukes && C >= 4 && M < (I.landShare > 0.2 ? 2 : 1)) {
@@ -1925,8 +2349,10 @@
     units.sort((a, b) => a.level() - b.level());
     const u = units[0];
     const res = await me.buildables(u.tile(), [type]);
-    const b = (res || []).find((x) => x.type === type && x.canUpgrade !== false);
+    const b = (res || []).find((x) => x.type === type);
     if (!b) return null;
+    // The game reports no upgrade it can't pay for yet; the price is known: plan it.
+    if (b.canUpgrade === false) return num(b.cost) > I.gold ? { unit: u, id: null, cost: num(b.cost), amount: 1 } : null;
     // upgradeCosts[k-1] is the total for k levels at once.
     const costs = (b.upgradeCosts && b.upgradeCosts.length ? b.upgradeCosts : [b.cost]).map(num);
     let amount = 1;
@@ -1940,7 +2366,13 @@
     for (const t of cands) {
       const res = await me.buildables(t, [type]);
       const b = (res || []).find((x) => x.type === type);
-      if (!b || b.canBuild === false) continue;
+      if (!b) continue;
+      if (b.canBuild === false) {
+        // The game refuses every placement it can't pay for yet (whatever the
+        // tile). Return the price so the plan saves up instead of skipping it.
+        if (num(b.cost) > I.gold) return { tile: null, cost: num(b.cost) };
+        continue;
+      }
       // The game may move a port to a nearby lake shore: refuse that.
       if (type === UT.Port && !safe(() => g.isOceanShore(b.canBuild), false)) continue;
       return { tile: type === UT.Warship ? t : b.canBuild, cost: num(b.cost) };
@@ -1963,8 +2395,11 @@
     }
     if (!best) return null;
     const res = await me.buildables(best.tile(), [UT.SAMLauncher]);
-    const b = (res || []).find((x) => x.type === UT.SAMLauncher && x.canUpgrade !== false);
+    const b = (res || []).find((x) => x.type === UT.SAMLauncher);
     if (!b) return null;
+    if (b.canUpgrade === false) {
+      return num(b.cost) > I.gold ? { kind: "upgrade", unit: best, id: null, cost: num(b.cost), amount: 1 } : null;
+    }
     const costs = (b.upgradeCosts && b.upgradeCosts.length ? b.upgradeCosts : [b.cost]).map(num);
     let amount = 1;
     for (let k = 2; k <= Math.min(costs.length, Math.ceil(gap), 5); k++) if (costs[k - 1] <= gold) amount = k;
@@ -2027,9 +2462,11 @@
         brain.savingCost = action.cost;
         // Defense is urgent but not worth blocking the economy for - except
         // a MIRV shield we can finish soon.
-        if (isDefense && !want.shield) continue;
+        if (isDefense && !want.shield && !want.save) continue;
         return 0;
       }
+      // A planned (not yet affordable) purchase has no tile / unit id yet.
+      if (action.kind === "upgrade" ? action.id == null : action.tile == null) continue;
       if (action.kind === "upgrade") {
         if (!emit("upgrade", { unitId: action.id, unitType: want.type, amount: action.amount })) continue;
         upgraded.add(action.id);
@@ -2452,6 +2889,14 @@
         I.unclaimedContacts === 0 &&
         !I.neighbors.some((n) => n.type === PT.Bot && !n.friendly && !n.walled) &&
         I.incomingTroops < I.troops * 0.3;
+      // Island bunker: survive and grow rich first, break out late or once
+      // stronger than everyone.
+      I.islandExit =
+        S.islandMode && (I.secondsIn > 35 * 60 || (I.secondsIn > 15 * 60 && I.troops >= I.strongestOther * 1.2));
+      if (I.islandExit && !brain.islandExitLogged) {
+        brain.islandExitLogged = true;
+        log("🏝 Island bunker: breakout phase – landings on players allowed");
+      }
       const strat = chooseStrategy(I);
       const policy = troopPolicy(I, strat);
       I.policy = policy;
@@ -2473,6 +2918,7 @@
         if (!attacked) await doBoat(g, me, I, policy, strat);
       }
       await doNukes(g, me, I, strat);
+      doNavy(g, me, I);
       doCityTrim(I);
       await doBuild(g, me, I, policy, strat);
     } catch (e) {
@@ -2575,6 +3021,7 @@
           ${toggle("requestAlliances", "Ask strong for peace")}
           ${toggle("nukes", "Nukes")}
           ${toggle("adaptive", "Adaptive aggression")}
+          ${toggle("islandMode", "Island bunker")}
         </div>
         <div class="row" style="margin-top:6px"><span>Aggression</span><span data-f="aggr"></span></div>
         <input type="range" min="1" max="10" step="1" data-k="aggression">
@@ -2771,7 +3218,8 @@
         ${nbs || '<div class="muted">none</div>'}
         ${I.enemySilos > 0 ? `<div class="warn">☢ Enemies own ${I.enemySilos} missile silo(s)</div>` : ""}
         ${I.enemySilos > 0 && I.shield && I.shield.minLeak > 0 ? `<div class="row"><span>MIRV shield</span><span class="${I.shield.leak < I.shield.minLeak ? "good" : I.shield.needed ? "bad" : "muted"}">${pct(I.shield.leak)} would land (they fire at ${pct(I.shield.minLeak)}+)</span></div>` : ""}
-        ${I.enemyNavy > 0 ? `<div class="muted">⚓ ${I.enemyNavy} hostile ship(s) at sea</div>` : ""}`;
+        ${I.enemyNavy > 0 ? `<div class="muted">⚓ ${I.enemyNavy} hostile ship(s) at sea</div>` : ""}
+        ${S.islandMode ? `<div class="row"><span>🏝 Island bunker</span><span>${I.islandExit ? "breakout" : "bunker"} · guards ${[...brain.navyRole.values()].filter((r) => r === "defend").length} · raiders ${[...brain.navyRole.values()].filter((r) => r === "raid").length}${hook.ctors.moveWarship ? "" : " (no ship control)"}</span></div>` : ""}`;
     }
     q("review").innerHTML = lastReview
       ? `<div class="sec">Last game review</div>

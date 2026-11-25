@@ -98,8 +98,21 @@ public class MainActivity extends Activity {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri uri = request.getUrl();
-                if (isGameUrl(uri) || !request.isForMainFrame()) return false;
-                // Anything that is not the game (Discord, store links…) goes to the browser.
+                // The game and its Discord sign-in stay in the app, so the
+                // account is signed in here and not in the phone's browser.
+                if (isInAppUrl(uri) || !request.isForMainFrame()) return false;
+                if (isGoogleSignIn(uri)) {
+                    // Google refuses sign-in inside an embedded WebView
+                    // (disallowed_useragent), and in the browser it would
+                    // sign in the browser, not the app.
+                    Toast.makeText(MainActivity.this,
+                            "Google sign-in doesn't work inside the app. Use Discord.",
+                            Toast.LENGTH_LONG).show();
+                    String current = view.getUrl();
+                    if (current == null || current.contains("/auth/login/")) view.loadUrl(HOME);
+                    return true;
+                }
+                // Anything else (store links…) goes to the browser.
                 try {
                     startActivity(new Intent(Intent.ACTION_VIEW, uri));
                 } catch (ActivityNotFoundException ignored) {
@@ -129,6 +142,20 @@ public class MainActivity extends Activity {
                 return true;
             }
         });
+    }
+
+    private static boolean isInAppUrl(Uri uri) {
+        if (isGameUrl(uri)) return true;
+        String host = uri.getHost();
+        if (host == null) return false;
+        // Discord's OAuth pages (login, authorize, captcha) during sign-in.
+        return host.equals("discord.com") || host.endsWith(".discord.com")
+                || host.equals("discordapp.com") || host.endsWith(".discordapp.com");
+    }
+
+    private static boolean isGoogleSignIn(Uri uri) {
+        String host = uri.getHost();
+        return host != null && host.equals("accounts.google.com");
     }
 
     private static boolean isGameUrl(Uri uri) {
@@ -179,7 +206,20 @@ public class MainActivity extends Activity {
     }
 
     // The WebView is deliberately NOT paused in onPause(), so the bot keeps
-    // thinking if another window briefly covers the app.
+    // thinking if another window briefly covers the app. Cookies (the signed-in
+    // session) are written to disk right away, so closing the app keeps the
+    // account signed in.
+    @Override
+    protected void onPause() {
+        super.onPause();
+        CookieManager.getInstance().flush();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        CookieManager.getInstance().flush();
+    }
 
     @Override
     protected void onSaveInstanceState(Bundle outState) {
