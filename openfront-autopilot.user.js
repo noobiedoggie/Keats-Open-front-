@@ -178,6 +178,7 @@
     allianceExtend: /\bonSendAllianceExtensionIntent\s*\(/,
     cancelAttack: /\bonCancelAttackIntentEvent\s*\(/,
     deleteUnit: /\bonSendDeleteUnitIntent\s*\(/,
+    targetPlayer: /\bonSendTargetPlayerIntent\s*\(/,
   };
 
   const hook = {
@@ -280,6 +281,8 @@
     botWall: new Map(), // bot smallID -> {walled, tick}
     farms: [], // bots being farmed, for the panel
     savingCost: 0, // what the build plan is saving for
+    hitAt: new Map(), // smallID -> tick we last attacked them (their relation to us drops)
+    mirvCost: 25_000_000, // the game's current MIRV price
     gameEndHandled: false,
     openingSent: false,
     spawn: null,
@@ -293,6 +296,9 @@
       this.allianceAsked.clear();
       this.troopHistory.clear();
       this.botWall.clear();
+      this.hitAt.clear();
+      this.mirvCost = 25_000_000;
+      this.mirvCostAt = undefined;
       this.farms = [];
       this.savingCost = 0;
       this.gameEndHandled = false;
@@ -388,10 +394,13 @@
           }
           continue;
         }
-        neighborCount.set(o, (neighborCount.get(o) || 0) + 1);
+        const cnt = (neighborCount.get(o) || 0) + 1;
+        neighborCount.set(o, cnt);
         let arr = neighborTiles.get(o);
         if (!arr) neighborTiles.set(o, (arr = []));
+        // Reservoir sample: spread along the whole front, not its first stretch.
         if (arr.length < 64) arr.push(n);
+        else if (Math.random() < 64 / cnt) arr[Math.floor(Math.random() * 64)] = n;
       }
     }
 
@@ -491,6 +500,9 @@
     for (const a of incoming) {
       attackers.set(a.attackerID, (attackers.get(a.attackerID) || 0) + num(a.troops));
     }
+    // Attacking a nation drops its relation to us by 60-100 (decaying 0.5/s):
+    // it refuses alliances and hates us for a while.
+    for (const a of outgoing) if (a.targetID !== 0) brain.hitAt.set(a.targetID, tick);
 
     // Our units.
     const mine = {};
@@ -520,6 +532,13 @@
     } else {
       cx = (minX + maxX) / 2;
       cy = (minY + maxY) / 2;
+    }
+    // The MIRV price rises with every MIRV launched; read it from the game.
+    if (owned.length && (brain.mirvCostAt === undefined || tick - brain.mirvCostAt > 300)) {
+      brain.mirvCostAt = tick;
+      const res = await me.buildables(owned[0], [UT.MIRV]).catch(() => []);
+      const b = (res || []).find((x) => x.type === UT.MIRV);
+      if (b && num(b.cost) > 0) brain.mirvCost = num(b.cost);
     }
 
     // Threats from far away: silos, enemy navy, nukes in flight at us.
@@ -552,7 +571,7 @@
       if (
         !safe(() => me.isFriendly(p), false) &&
         safe(() => p.units(UT.MissileSilo).length, 0) > 0 &&
-        num(safe(() => p.gold(), 0)) >= 15_000_000
+        num(safe(() => p.gold(), 0)) >= brain.mirvCost * 0.6 // saving up for one
       ) {
         mirvThreats.push(p);
       }
@@ -575,7 +594,71 @@
     const land = me.numTilesOwned();
     const totalLand = Math.max(1, num(safe(() => g.numLandTiles(), 0)) || 1);
 
+    // MIRV shield, estimated the way the nations do before saving up for or
+    // launching a MIRV: land / 2000 warheads (max 350) spread over our land;
+    // each SAM stops as many warheads as its level among those in its range.
+    // Nations only fire when 10% (Medium) / 20% (Hard) / 25% (Impossible) of
+    // the warheads would land, so a shield above that line is never MIRVed.
+    // Easy nations never check.
+    const minLeak = { Medium: 0.1, Hard: 0.2, Impossible: 0.25 }[difficulty] ?? 0;
+    const shield = (() => {
+      if (!owned.length) return null;
+      const sams = mine[UT.SAMLauncher].filter((u) => !u.isUnderConstruction());
+      const warheads = Math.min(350, Math.max(1, land / 2000));
+      const wps = warheads / owned.length;
+      const inRange = new Map();
+      const uncovered = [];
+      let covered = 0;
+      for (const t of owned) {
+        let hit = false;
+        for (const s of sams) {
+          if (dist(g, s.tile(), t) <= safe(() => cfg.samRange(s.level()), 70)) {
+            inRange.set(s, (inRange.get(s) || 0) + wps);
+            hit = true;
+          }
+        }
+        if (hit) covered++;
+        else uncovered.push(t);
+      }
+      let shots = 0;
+      for (const [s, n] of inRange) shots += Math.min(s.level(), n);
+      const leak = 1 - Math.min(covered * wps, shots) / warheads;
+      // Aim well under the line: SAMs get lost, land grows.
+      const goal = minLeak * 0.6;
+      const missingShots = Math.max(0, warheads * (1 - goal) - shots);
+      const missingSams = Math.max(0, Math.ceil(((uncovered.length / owned.length - goal) * land) / (Math.PI * 70 * 70)));
+      // SAMs and their levels cost up to 3M each.
+      const missingCost = (missingShots + missingSams) * 3_000_000;
+      // Would a nation MIRV us at all? Only a big enough target (vs the
+      // hydrogen bombs the price buys), and only for a reason: near the
+      // victory line, over the city-steamroll line, or (Hard/Impossible) as
+      // the rival of a bordering nation at most twice our size.
+      const tilesNeeded = ({ Medium: 0.1, Hard: 0.2, Impossible: 0.2 }[difficulty] ?? 0) * (brain.mirvCost / 5_000_000) * Math.PI * 100 * 100;
+      const denial = { Easy: 0.75, Medium: 0.65, Hard: 0.55, Impossible: 0.4 }[difficulty] ?? 0.65;
+      const rival =
+        (difficulty === "Hard" || difficulty === "Impossible") &&
+        neighbors.some((n) => !n.friendly && mirvThreats.includes(n.p) && land >= n.land * 0.5);
+      const reason =
+        land / totalLand >= denial - 0.07 ? "victory line" : myCityLevels >= mirvLine * 0.9 ? "city lead" : rival ? "rival" : null;
+      const needed = minLeak > 0 && mirvThreats.length > 0 && land >= tilesNeeded * 0.8 && reason !== null;
+      return {
+        leak,
+        minLeak,
+        coverage: covered / owned.length,
+        shots,
+        warheads,
+        uncovered,
+        inRange,
+        missingCost,
+        needed,
+        reason,
+        solid: minLeak > 0 && leak < minLeak * 0.5,
+      };
+    })();
+
     return {
+      difficulty,
+      shield,
       tick,
       myID,
       cx,
@@ -766,18 +849,27 @@
     // save us anyway, while eating bots makes us bigger.
     let homeGuard = Math.min(strat.biggestPlayer * homeFactor, I.troops * 0.6) + I.incomingTroops;
     if (strat.crowned) homeGuard = Math.max(homeGuard, Math.min(strat.borderNationTroops * 0.5, I.troops * 0.8));
-    // Troops free for player wars: above both the growth reserve and the guard.
-    const sendable = Math.max(0, I.troops - Math.max(reserve * I.maxTroops, homeGuard));
-    // Troops free for bots / free land. The game's own nations keep only
-    // 10-20% of their cap when grabbing land, so we do the same: land is max
-    // troops, and troops regrow fastest when the army is low.
-    const expandFloor = (0.22 - aggr * 0.01) * I.maxTroops; // 21% .. 12%
     // Land rush: a nation that touches free land always expands into it
     // before attacking a player, so early on the neighbours are busy too and
     // a big home guard only makes us slower than them.
     const landRush = I.unclaimedContacts > 0 && I.secondsIn < 480 && I.incomingTroops < I.troops * 0.2;
+    // Hard and Impossible nations go after a player whose troops drop under
+    // 15% of its own cap ("very weak") ahead of nearly every other target:
+    // never look like that while a nation can reach us (just at the line
+    // during the land rush, when they are busy with free land).
+    const weakFloor =
+      (I.difficulty === "Hard" || I.difficulty === "Impossible") &&
+      I.neighbors.some((n) => !n.friendly && n.type === PT.Nation)
+        ? (landRush ? 0.15 : 0.18) * I.maxTroops
+        : 0;
+    // Troops free for player wars: above both the growth reserve and the guard.
+    const sendable = Math.max(0, I.troops - Math.max(reserve * I.maxTroops, homeGuard, weakFloor));
+    // Troops free for bots / free land. The game's own nations keep only
+    // 10-20% of their cap when grabbing land, so we do the same: land is max
+    // troops, and troops regrow fastest when the army is low.
+    const expandFloor = Math.max((0.22 - aggr * 0.01) * I.maxTroops, weakFloor); // 21% .. 12%
     const safeSendable = Math.max(0, I.troops - Math.max(expandFloor, homeGuard * (landRush ? 0.35 : 0.9)));
-    return { reserve, trigger, threat, sendable, safeSendable, homeGuard, homeFactor, expandFloor, aggr, landRush };
+    return { reserve, trigger, threat, sendable, safeSendable, homeGuard, homeFactor, expandFloor, weakFloor, aggr, landRush };
   }
 
   // ----- spawn -------------------------------------------------------------------
@@ -997,13 +1089,11 @@
         const key = "accept:" + p.id();
         if (!brain.cd.ready(key, 15000)) continue;
         brain.cd.mark(key);
-        const hitting = I.attackers.get(p.smallID()) || 0;
         const isNeighbor = neighborBySid.has(p.smallID());
         const theirs = num(p.troops());
-        // Refuse someone hitting us hard, and refuse weak neighbours we are about
-        // to eat (an alliance would block the expansion). Distant or strong ones
-        // are free safety.
-        if (hitting > I.troops * 0.5) continue;
+        // Refuse weak neighbours we are about to eat (an alliance would block
+        // the expansion). Distant or strong ones are free safety, and an
+        // attacker's attack stops the moment it becomes our ally.
         const preyRatio = strat.stance === "Endgame" ? 0.7 : 0.35;
         // Blocked or in the endgame, a weak ally anywhere is just a future
         // wall: one game sat 30 minutes behind an ally 400x weaker.
@@ -1043,17 +1133,70 @@
       log(`Asked to extend alliance with ${other.displayName()}`);
     }
 
-    // Ask far stronger neighbours for peace so they pick someone else.
+    // Ask for peace where a nation would say yes, attackers and the strongest
+    // first. Nations accept a player they see as a threat (Medium: 2.5x their
+    // troops; Hard: more troops and 2x their cap; Impossible: 1.5x troops, or
+    // more troops and a 1.5x cap or land), or one about as strong as them
+    // while their relation to us isn't hostile (we haven't attacked them
+    // lately). They refuse a runaway leader, and on Hard / Impossible anyone
+    // already allied with half / a quarter of the players. Weak neighbours
+    // stay prey; humans are only asked when much stronger.
     if (S.requestAlliances && !I.immunity) {
-      for (const n of I.neighbors) {
-        if (n.friendly || n.type === PT.Bot) continue;
-        if (n.troops < I.troops * 1.15) continue;
+      const d = I.difficulty;
+      const nonBots = g.players().filter((p) => p.isAlive() && p.type() !== PT.Bot).length;
+      const allyShare = { Hard: 0.5, Impossible: 0.25 }[d];
+      const myAllies = (safe(() => me.alliances(), []) || []).length;
+      const capped = allyShare !== undefined && myAllies >= nonBots * allyShare;
+      const runaway = I.runawayFactor !== null && I.runawayRatio >= I.runawayFactor;
+      const maxT = (p) => num(safe(() => g.config().maxTroops(p), 0));
+      const seesThreat = (n) => {
+        if (d === "Medium") return I.troops > n.troops * 2.5;
+        if (d === "Hard") return I.troops > n.troops && I.maxTroops > maxT(n.p) * 2;
+        if (d === "Impossible") {
+          return I.troops > n.troops * 1.5 || (I.troops > n.troops && (I.maxTroops > maxT(n.p) * 1.5 || I.land > n.land * 1.5));
+        }
+        return false;
+      };
+      const warOn = new Set(I.outgoing.map((a) => a.targetID));
+      const cands =
+        capped || runaway
+          ? []
+          : I.neighbors
+              .filter((n) => !n.friendly && n.type !== PT.Bot && !warOn.has(n.sid))
+              .filter((n) => {
+                const hitting = I.attackers.get(n.sid) || 0;
+                if (n.type === PT.Human) return n.troops >= I.troops * 1.15;
+                if (n.troops < I.troops * 0.6 && hitting < I.troops * 0.15) return false;
+                if (seesThreat(n)) return true;
+                const hit = brain.hitAt.get(n.sid);
+                return hit === undefined || I.tick - hit > 2000; // their anger has cooled
+              })
+              .sort((a, b) => (I.attackers.get(b.sid) || 0) - (I.attackers.get(a.sid) || 0) || b.troops - a.troops);
+      for (const n of cands) {
         const last = brain.allianceAsked.get(n.p.id());
-        if (last !== undefined && I.tick - last < 90 * TICKS_PER_SEC) continue;
+        if (last !== undefined && I.tick - last < 60 * TICKS_PER_SEC) continue;
         brain.allianceAsked.set(n.p.id(), I.tick);
         emit("allianceRequest", { requestor: me, recipient: n.p });
-        log(`Requested alliance with stronger neighbour ${n.p.displayName()}`);
+        const hitting = I.attackers.get(n.sid) || 0;
+        log(`Requested alliance with ${n.p.displayName()} (${hitting ? "attacking us" : n.troops > I.troops ? "stronger" : "a real threat"})`);
         break; // one per cycle
+      }
+    }
+
+    // Allies on friendly terms (a fresh alliance starts at +100 and cools by
+    // 0.5/s) attack whoever we mark as our target: point them at our worst
+    // attacker, else at the player we are at war with.
+    if (hook.ctors.targetPlayer && brain.cd.ready("mark", 16000)) {
+      const fresh = (safe(() => me.alliances(), []) || []).some((a) => I.tick - a.createdAt < 900);
+      const worst = [...I.attackers.entries()].filter(([s]) => !isBotID(I, s)).sort((a, b) => b[1] - a[1])[0];
+      const war = I.outgoing.find((a) => a.targetID !== 0 && !isBotID(I, a.targetID));
+      const sid = worst ? worst[0] : war ? war.targetID : undefined;
+      const p = fresh && sid !== undefined ? safe(() => g.playerBySmallID(sid), null) : null;
+      if (p && p.isPlayer && p.isPlayer() && p.type() !== PT.Bot && !safe(() => me.isFriendly(p), true)) {
+        if (emit("targetPlayer", { targetID: p.id() })) {
+          brain.cd.mark("mark");
+          log(`🎯 Marked ${p.displayName()} as target for our allies`);
+        }
       }
     }
   }
@@ -1064,11 +1207,14 @@
     if (!S.defend || !hook.ctors.cancelAttack) return false;
     if (strat.threat < 0.7 || I.troops > I.incomingTroops * 1.3) return false;
     if (!brain.cd.ready("retreat", 8000)) return false;
+    // A retreat from a player costs 25% of the troops, from free land nothing:
+    // call those back first.
     const candidates = I.outgoing
       .filter((a) => !I.attackers.has(a.targetID)) // keep counter-attacks going
-      .sort((a, b) => num(b.troops) - num(a.troops));
+      .filter((a) => num(a.troops) >= I.maxTroops * 0.05)
+      .sort((a, b) => (a.targetID === 0 ? 0 : 1) - (b.targetID === 0 ? 0 : 1) || num(b.troops) - num(a.troops));
     const a = candidates[0];
-    if (!a || num(a.troops) < I.maxTroops * 0.05) return false;
+    if (!a) return false;
     if (emit("cancelAttack", { attackID: a.id })) {
       brain.cd.mark("retreat");
       log(`Retreating ${fmtTroops(a.troops)} troops to defend the homeland`);
@@ -1116,6 +1262,9 @@
     if (nuked && I.troops < n.troops * 2) score *= 0.3; // fallout, unless we vastly outnumber them
     if (hittingUs > 0 && n.troops < I.troops) score *= 1.6; // revenge while they are committed
     if (n.trend > 0.35 && n.troops < I.troops) score *= 1.2; // strike before they finish massing
+    // Drained (under 20% of its cap): Hard/Impossible nations pile on such a
+    // player first, so take its land before they do.
+    if (n.type !== PT.Bot && n.troops < num(safe(() => hook.game.config().maxTroops(n.p), 0)) * 0.2) score *= 1.4;
     // Loot: taking a nation hands over all its gold. Disarm: a nation with a
     // silo and MIRV money is the one that would MIRV us - take it first.
     const theirGold = num(safe(() => n.p.gold(), 0));
@@ -1308,6 +1457,7 @@
           n.troops * 0.6,
           otherGuard,
           I.maxTroops * 0.15,
+          policy.weakFloor,
           strat.leader && I.enemySilos > 0 ? I.maxTroops * 0.4 : 0,
         ) + I.incomingTroops;
       return Math.max(0, I.troops - keepHome);
@@ -1362,7 +1512,9 @@
         .sort((a, b) => b.ease - a.ease);
       for (const { n } of options) {
         // Breaking out means accepting risk: keep 30% home, send up to 70%.
-        const amount = Math.floor(Math.min(I.troops * 0.7 - I.incomingTroops, n.troops * 1.75));
+        const amount = Math.floor(
+          Math.min(Math.min(I.troops * 0.7, I.troops - policy.weakFloor) - I.incomingTroops, n.troops * 1.75),
+        );
         if (amount < n.troops * 0.7 || amount < I.maxTroops * 0.05) continue;
         if (emit("attack", { targetID: n.p.id(), troops: amount })) {
           brain.cd.mark("breakout");
@@ -1509,6 +1661,39 @@
     );
   }
 
+  // Defense posts multiply an attacker's losses by 5 and slow it 3x on our
+  // tiles within 30 of the post. Nations never look at posts when they pick
+  // a target, so a covered front makes them bleed.
+  const POST_REACH = 27;
+  /** The part of a front no post covers: attackers (reactive), else strong nations next door. */
+  function postFront(g, I, strat, reactive) {
+    const fronts = reactive
+      ? I.neighbors.filter((n) => n.type !== PT.Bot && (I.attackers.get(n.sid) || 0) > I.troops * 0.05)
+      : I.neighbors.filter(
+          (n) =>
+            isPlayerNeighbor(n) &&
+            (strat.crowned ||
+              strat.dangerous.includes(n) ||
+              n.troops > I.troops * 1.2 ||
+              (n.trend > 0.35 && n.troops > I.troops * 0.8)),
+        );
+    const posts = I.mine[UT.DefensePost].map((u) => u.tile());
+    const uncovered = [];
+    let total = 0;
+    for (const n of fronts) {
+      for (const t of n.tiles) {
+        total++;
+        if (minDist(g, t, posts, POST_REACH + 1) > POST_REACH) uncovered.push(t);
+      }
+    }
+    return {
+      uncovered,
+      coverage: total ? 1 - uncovered.length / total : 1,
+      contacts: fronts.reduce((s, n) => s + n.contacts, 0),
+      any: fronts.length > 0,
+    };
+  }
+
   /** Decide what we want next, in priority order. */
   function wantedStructures(I, policy, strat) {
     const g0 = hook.game;
@@ -1523,29 +1708,52 @@
     const coastal = I.shore.length > 0;
     const wants = [];
 
-    if (S.defend && policy.threat > 0.35 && D < Math.min(6, 2 + Math.floor(policy.threat / 0.4))) {
-      wants.push({ type: UT.DefensePost, why: "under attack" });
+    const hot = S.defend && policy.threat > 0.1 ? postFront(g0, I, strat, true) : null;
+    if (hot && hot.any && hot.coverage < 0.8 && D < Math.min(30, 3 + Math.ceil(hot.contacts / 40))) {
+      wants.push({ type: UT.DefensePost, why: `under attack: front ${pct(hot.coverage)} covered`, front: hot.uncovered });
     }
     if (S.defend && I.nukesAtUs > 0 && SAM < C + 1) {
       wants.push({ type: UT.SAMLauncher, why: "nukes incoming" });
+    }
+    // A nation saving up for a MIRV at us and a shield we can finish soon:
+    // save for it before anything else (half a shield stops nothing).
+    const sh = I.shield;
+    if (S.defend && sh && sh.needed && sh.leak >= sh.minLeak * 0.8 && sh.missingCost <= Math.max(brain.mirvCost * 1.5, I.gold)) {
+      wants.push({
+        type: UT.SAMLauncher,
+        why: `MIRV shield (${sh.reason}: ${pct(sh.leak)} of warheads would land)`,
+        shield: true,
+      });
     }
     const samTarget = strat.crowned || strat.decapitate ? Math.ceil(C * 0.7) : strat.leader ? Math.ceil(C * 0.5) : Math.ceil(C * 0.35);
     if (S.defend && I.enemySilos > 0 && SAM < Math.max(1, samTarget)) {
       wants.push({ type: UT.SAMLauncher, why: strat.leader ? "leader: MIRV shield" : "enemies have nukes" });
     }
     if (C === 0) wants.push({ type: UT.City, why: "first city" });
-    // A strong player next door: fortify that border right after the first city.
-    if (S.defend && C >= 1 && (strat.massing || strat.careful || strat.crowned) && D < Math.min(strat.crowned ? 10 : 5, 2 + strat.dangerous.length + (strat.crowned ? 4 : 0))) {
-      wants.push({
-        type: UT.DefensePost,
-        why: strat.crowned ? "runaway leader: fortify before the gang-up" : strat.careful ? "strong player next door" : "neighbour massing troops",
-        proactive: true,
-      });
-    }
     // Each city level adds 250K max troops: by far the best buy in the game.
-    // Keep at least as many cities as ports + factories.
-    const underRadar = I.myCityLevels < I.cityLevelCap;
-    if (underRadar && (C < 2 || C <= P + F)) wants.push({ type: UT.City, why: "+250K max troops", cityChoice: true });
+    // Keep at least as many cities as ports + factories. A solid MIRV shield
+    // makes the nations' city-lead line harmless.
+    const underRadar = I.myCityLevels < I.cityLevelCap || !!(sh && sh.solid);
+    const cityWant = underRadar && (C < 2 || C <= P + F) ? { type: UT.City, why: "+250K max troops", cityChoice: true } : null;
+    // A strong nation next door: cover that border with posts once the
+    // economy has started (before that, cities first).
+    const cold = S.defend && C >= 1 ? postFront(g0, I, strat, false) : null;
+    const postWant =
+      cold && cold.any && cold.coverage < 0.7 && D < Math.min(30, 2 + Math.ceil(cold.contacts / 50))
+        ? {
+            type: UT.DefensePost,
+            why: strat.crowned ? "runaway leader: fortify before the gang-up" : `strong nation next door: front ${pct(cold.coverage)} covered`,
+            proactive: true,
+            front: cold.uncovered,
+          }
+        : null;
+    if (C >= 3) {
+      if (postWant) wants.push(postWant);
+      if (cityWant) wants.push(cityWant);
+    } else {
+      if (cityWant) wants.push(cityWant);
+      if (postWant) wants.push(postWant);
+    }
     // Nuclear program as early as the economy allows: a silo right after the
     // first two cities, then a SAM so enemy nukes can't wipe us out.
     // Nuclear program once the economy can carry it: a 1M silo at 2 cities
@@ -1586,7 +1794,7 @@
     return wants;
   }
 
-  function placementCandidates(g, I, type, proactive) {
+  function placementCandidates(g, I, type, proactive, focus) {
     const all = [];
     for (const t of STRUCTURES) for (const u of I.mine[t]) all.push(u.tile());
     const same = I.mine[type].map((u) => u.tile());
@@ -1596,7 +1804,33 @@
     if (type === UT.Port) pool = I.shore.filter((t) => g.ownerID(t) === I.myID);
 
     const enemyFront = [];
-    if (type === UT.DefensePost) {
+    if (focus && focus.length && type === UT.DefensePost) {
+      // Cover the uncovered front: also try spots ~9 tiles behind our border
+      // there (the random interior sample rarely lands near a long front).
+      enemyFront.push(...focus);
+      const inward = [];
+      for (const f of sampleArray(focus, 24)) {
+        let b = null,
+          bd = Infinity;
+        for (const t of I.borderSample) {
+          const d = dist(g, t, f);
+          if (d < bd) [b, bd] = [t, d];
+        }
+        if (b === null || bd > 6) continue;
+        const dx = g.x(b) - g.x(f),
+          dy = g.y(b) - g.y(f);
+        const len = Math.hypot(dx, dy) || 1;
+        const x = Math.round(g.x(b) + (dx / len) * 9),
+          y = Math.round(g.y(b) + (dy / len) * 9);
+        if (!g.isValidCoord(x, y)) continue;
+        const t = g.ref(x, y);
+        if (g.ownerID(t) === I.myID && g.isLand(t)) inward.push(t);
+      }
+      pool = inward.concat(sampleArray(I.owned, 140));
+    } else if (focus && focus.length && type === UT.SAMLauncher) {
+      // MIRV shield: land no SAM reaches yet (focus tiles are our own land).
+      pool = focus.concat(I.owned);
+    } else if (type === UT.DefensePost) {
       if (!proactive) {
         for (const [sid] of I.attackers) {
           const n = I.neighbors.find((x) => x.sid === sid);
@@ -1632,12 +1866,26 @@
           s = spreadSame * 2 + spreadAll * 0.3;
           break;
         case UT.SAMLauncher:
-          // Close to what is worth protecting.
-          s = -minDist(g, t, cities.length ? cities : all, 100) * 1.5 + spreadSame * 1.2 + Math.min(toBorder, 20);
+          if (focus && focus.length) {
+            // Reach as much uncovered land as a level 1 SAM (70 tiles) can.
+            let reach = 0;
+            for (const f of focus) if (dist(g, t, f) <= 66) reach++;
+            s = reach * 3 + Math.min(toBorder, 20) * 0.5 + Math.min(spreadSame, 60) * 0.2;
+          } else {
+            // Close to what is worth protecting.
+            s = -minDist(g, t, cities.length ? cities : all, 100) * 1.5 + spreadSame * 1.2 + Math.min(toBorder, 20);
+          }
           break;
         case UT.DefensePost: {
           const front = minDist(g, t, enemyFront, 200);
-          s = -Math.abs(front - 7) * 3 + spreadSame * 0.8;
+          if (focus && focus.length) {
+            // As many uncovered front tiles as possible within reach.
+            let cover = 0;
+            for (const f of enemyFront) if (dist(g, t, f) <= POST_REACH) cover++;
+            s = cover * 5 - Math.abs(front - 9) * 1.5 + Math.min(spreadSame, 40) * 0.2;
+          } else {
+            s = -Math.abs(front - 7) * 3 + spreadSame * 0.8;
+          }
           break;
         }
       }
@@ -1687,8 +1935,8 @@
   }
 
   /** Cheapest valid new placement of a type, with its cost. */
-  async function buildOption(g, me, I, type, proactive) {
-    const cands = type === UT.Warship ? warshipCandidates(g, I) : placementCandidates(g, I, type, proactive);
+  async function buildOption(g, me, I, type, proactive, focus) {
+    const cands = type === UT.Warship ? warshipCandidates(g, I) : placementCandidates(g, I, type, proactive, focus);
     for (const t of cands) {
       const res = await me.buildables(t, [type]);
       const b = (res || []).find((x) => x.type === type);
@@ -1698,6 +1946,29 @@
       return { tile: type === UT.Warship ? t : b.canBuild, cost: num(b.cost) };
     }
     return null;
+  }
+
+  /** Next MIRV shield purchase: a SAM over land no SAM reaches, else levels where warheads outnumber them. */
+  async function shieldOption(g, me, I, skip, gold) {
+    const sh = I.shield;
+    if (sh.uncovered.length / Math.max(1, I.owned.length) > sh.minLeak * 0.6) {
+      const nb = await buildOption(g, me, I, UT.SAMLauncher, false, sh.uncovered);
+      if (nb) return { kind: "build", ...nb };
+    }
+    let best = null,
+      gap = 0.5;
+    for (const [s, n] of sh.inRange) {
+      if (skip.has(s.id && s.id())) continue;
+      if (n - s.level() > gap) [best, gap] = [s, n - s.level()];
+    }
+    if (!best) return null;
+    const res = await me.buildables(best.tile(), [UT.SAMLauncher]);
+    const b = (res || []).find((x) => x.type === UT.SAMLauncher && x.canUpgrade !== false);
+    if (!b) return null;
+    const costs = (b.upgradeCosts && b.upgradeCosts.length ? b.upgradeCosts : [b.cost]).map(num);
+    let amount = 1;
+    for (let k = 2; k <= Math.min(costs.length, Math.ceil(gap), 5); k++) if (costs[k - 1] <= gold) amount = k;
+    return { kind: "upgrade", unit: best, id: b.canUpgrade, cost: costs[amount - 1], amount };
   }
 
   async function doBuild(g, me, I, policy, strat) {
@@ -1728,7 +1999,9 @@
       if (want.type === UT.MissileSilo && !S.nukes) continue;
 
       let action = null; // {kind:'build'|'upgrade', cost, ...}
-      if (want.upgrade) {
+      if (want.shield) {
+        action = await shieldOption(g, me, I, upgraded, gold);
+      } else if (want.upgrade) {
         const up = await upgradeOption(me, I, want.type, upgraded, gold);
         if (up) action = { kind: "upgrade", ...up };
       } else if (want.cityChoice) {
@@ -1743,7 +2016,7 @@
         } else if (nb) action = { kind: "build", ...nb };
         else if (up) action = { kind: "upgrade", ...up };
       } else {
-        const nb = await buildOption(g, me, I, want.type, want.proactive);
+        const nb = await buildOption(g, me, I, want.type, want.proactive, want.front);
         if (nb) action = { kind: "build", ...nb };
       }
       if (!action) continue;
@@ -1752,8 +2025,9 @@
         if (want.optional) continue;
         brain.plan = `Saving for ${want.type}${action.kind === "upgrade" ? " upgrade" : ""} – ${want.why} (${fmt(gold)}/${fmt(action.cost)})`;
         brain.savingCost = action.cost;
-        // Defense is urgent but not worth blocking the economy for.
-        if (isDefense) continue;
+        // Defense is urgent but not worth blocking the economy for - except
+        // a MIRV shield we can finish soon.
+        if (isDefense && !want.shield) continue;
         return 0;
       }
       if (action.kind === "upgrade") {
@@ -1766,6 +2040,7 @@
         if (!emit("build", { unit: want.type, tile: action.tile })) continue;
         // Count it right away so the next purchase this cycle sees it.
         const tile = action.tile;
+        if (want.shield) I.shield.uncovered = I.shield.uncovered.filter((t) => dist(g, t, tile) > 70);
         I.mine[want.type].push({
           tile: () => tile,
           level: () => 1,
@@ -1789,6 +2064,7 @@
   function doCityTrim(I) {
     if (!S.build || !hook.ctors.deleteUnit) return false;
     if (I.myCityLevels < I.mirvLine || I.mirvThreats.length === 0) return false;
+    if (I.shield && I.shield.solid) return false; // their MIRVs would not get through
     if (!brain.cd.ready("trim", 31000)) return false;
     const over = I.myCityLevels - I.mirvLine + 1;
     const cities = I.mine[UT.City].filter((u) => u.id && !u.isUnderConstruction());
@@ -1840,6 +2116,7 @@
       if (!b || b.canBuild === false || I.gold < num(b.cost)) continue;
       if (emit("build", { unit: UT.AtomBomb, tile: silo.tile(), rocketDirectionUp: true })) {
         brain.cd.mark("nuke");
+        brain.hitAt.set(p.smallID(), I.tick); // a nuke costs us 100 relation
         log(`☢ Atom bomb on ${p.displayName()}'s missile silo (they can afford a MIRV)`);
         return;
       }
@@ -1867,6 +2144,7 @@
           p.isPlayer() &&
           !safe(() => me.isFriendly(p), true) &&
           atWarWith(p) &&
+          // Asked for peace lately: a nuke landing on a new ally makes us a traitor.
           !(brain.allianceAsked.has(p.id()) && I.tick - brain.allianceAsked.get(p.id()) < 900),
       );
     if (hostile.length === 0) return;
@@ -1925,6 +2203,7 @@
         brain.cd.mark("nuke");
         // Their land is fallout for a while: keep land attacks elsewhere.
         brain.nukeHit = { sid: target.smallID(), until: gameNow() + 90000 };
+        brain.hitAt.set(target.smallID(), I.tick); // a nuke costs us 100 relation
         log(`☢ Launched ${type} at ${target.displayName()} (value ${bestVal})`);
         return;
       }
@@ -2491,6 +2770,7 @@
         <div class="sec">Neighbours (${I.neighbors.length})${I.unclaimedContacts > 0 ? ' <span class="good">+ free land</span>' : ""}</div>
         ${nbs || '<div class="muted">none</div>'}
         ${I.enemySilos > 0 ? `<div class="warn">☢ Enemies own ${I.enemySilos} missile silo(s)</div>` : ""}
+        ${I.enemySilos > 0 && I.shield && I.shield.minLeak > 0 ? `<div class="row"><span>MIRV shield</span><span class="${I.shield.leak < I.shield.minLeak ? "good" : I.shield.needed ? "bad" : "muted"}">${pct(I.shield.leak)} would land (they fire at ${pct(I.shield.minLeak)}+)</span></div>` : ""}
         ${I.enemyNavy > 0 ? `<div class="muted">⚓ ${I.enemyNavy} hostile ship(s) at sea</div>` : ""}`;
     }
     q("review").innerHTML = lastReview
